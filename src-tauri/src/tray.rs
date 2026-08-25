@@ -8,9 +8,14 @@ use crate::{commands, history, hotkey, thumbnail};
 
 pub fn init(app: &AppHandle) -> tauri::Result<()> {
     let menu = build_menu(app)?;
+    let icon = match app.default_window_icon().cloned() {
+        Some(icon) => icon,
+        None => tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))
+            .expect("embedded 32x32.png icon must be valid PNG"),
+    };
     TrayIconBuilder::with_id("main")
         .tooltip("SnapDrop")
-        .icon(app.default_window_icon().cloned().expect("default icon"))
+        .icon(icon)
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(handle_menu_event)

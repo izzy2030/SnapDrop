@@ -217,17 +217,18 @@ pub fn capture_now(app: AppHandle) -> Result<(), String> {
 pub fn get_capture_preview(_app: AppHandle, path: String) -> Result<String, String> {
     use base64::Engine;
     let bytes = fs::read(&path).map_err(|e| e.to_string())?;
-    // If small enough, just return as base64 png, or load and thumbnail
-    if let Ok(img) = image::load_from_memory(&bytes) {
-        let rgba = img.to_rgba8();
-        let (w, h) = rgba.dimensions();
-        let mut bgra = Vec::with_capacity((w as usize) * (h as usize) * 4);
-        for px in rgba.pixels() {
-            bgra.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
-        }
-        if let Some(png) = filename::preview_png(&bgra, w, h, 256) {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
-            return Ok(format!("data:image/png;base64,{b64}"));
+    if let Ok(reader) = image::ImageReader::open(&path).and_then(|r| r.with_guessed_format()) {
+        if let Ok(img) = reader.decode() {
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            let mut bgra = Vec::with_capacity((w as usize) * (h as usize) * 4);
+            for px in rgba.pixels() {
+                bgra.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            }
+            if let Some(png) = filename::preview_png(&bgra, w, h, 256) {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+                return Ok(format!("data:image/png;base64,{b64}"));
+            }
         }
     }
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);

@@ -36,9 +36,11 @@ pub fn enrich_entry_metadata(entry: &mut HistoryEntry) {
     }
     if entry.width == 0 || entry.height == 0 {
         if let Ok(reader) = image::ImageReader::open(&entry.path) {
-            if let Ok(dimensions) = reader.into_dimensions() {
-                entry.width = dimensions.0;
-                entry.height = dimensions.1;
+            if let Ok(reader) = reader.with_guessed_format() {
+                if let Ok(dimensions) = reader.into_dimensions() {
+                    entry.width = dimensions.0;
+                    entry.height = dimensions.1;
+                }
             }
         }
     }
