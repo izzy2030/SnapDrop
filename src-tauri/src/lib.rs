@@ -78,6 +78,7 @@ pub fn run() {
             commands::get_pending_editor_image,
             commands::show_settings,
             commands::pick_folder,
+            commands::get_capture_preview,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

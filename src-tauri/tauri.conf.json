@@ -14,10 +14,10 @@
       {
         "label": "main",
         "title": "SnapDrop",
-        "width": 760,
-        "height": 640,
-        "minWidth": 560,
-        "minHeight": 480,
+        "width": 1176,
+        "height": 693,
+        "minWidth": 880,
+        "minHeight": 546,
         "center": true,
         "resizable": true,
         "visible": false

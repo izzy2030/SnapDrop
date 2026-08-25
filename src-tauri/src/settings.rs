@@ -34,7 +34,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             hotkey: "Ctrl+Shift+4".into(),
-            screenshot_dir: "%USERPROFILE%\\Pictures\\SnapDrop".into(),
+            screenshot_dir: filename::default_screenshot_dir().to_string_lossy().to_string(),
             format: "png".into(),
             start_with_windows: true,
             show_thumbnail: true,

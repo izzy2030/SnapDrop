@@ -1,9 +1,6 @@
-//! Orchestrates: hide thumbnails → overlay selection → capture → save → clipboard → show.
-
 use std::fs;
-
 use chrono::Local;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 use crate::{
     capture, clipboard, editor, filename, history, monitors, notifier, overlay, settings,
@@ -11,16 +8,32 @@ use crate::{
 };
 
 pub fn run(app: &AppHandle) {
-    // Hide floating thumbnails so they never appear in the capture.
+    // Hide main window and floating thumbnails so they never appear in the capture.
+    let main_was_visible = app
+        .get_webview_window("main")
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false);
+    if let Some(main_win) = app.get_webview_window("main") {
+        let _ = main_win.hide();
+    }
+
     let was_visible = thumbnail::is_visible(app);
     let _ = thumbnail::hide_all(app);
+
+    // Brief sleep to ensure DWM compositor updates the screen before capture overlay starts
+    std::thread::sleep(std::time::Duration::from_millis(50));
 
     let sel = match overlay::run() {
         Some(s) => s,
         None => {
-            // Cancelled — restore the thumbnail that was hidden.
+            // Cancelled — restore whatever was hidden.
             if was_visible {
                 let _ = thumbnail::set_visible(app, true);
+            }
+            if main_was_visible {
+                if let Some(main_win) = app.get_webview_window("main") {
+                    let _ = main_win.show();
+                }
             }
             return;
         }

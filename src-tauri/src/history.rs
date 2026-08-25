@@ -13,6 +13,12 @@ use crate::settings;
 pub struct HistoryEntry {
     pub path: String,
     pub captured_at: String,
+    #[serde(default)]
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
 }
 
 pub struct HistoryState(pub Mutex<Vec<HistoryEntry>>);
@@ -24,10 +30,27 @@ pub fn history_path(app: &AppHandle) -> PathBuf {
         .join("history.json")
 }
 
+pub fn enrich_entry_metadata(entry: &mut HistoryEntry) {
+    if let Ok(meta) = fs::metadata(&entry.path) {
+        entry.size_bytes = meta.len();
+    }
+    if entry.width == 0 || entry.height == 0 {
+        if let Ok(reader) = image::ImageReader::open(&entry.path) {
+            if let Ok(dimensions) = reader.into_dimensions() {
+                entry.width = dimensions.0;
+                entry.height = dimensions.1;
+            }
+        }
+    }
+}
+
 pub fn init(app: &AppHandle) -> tauri::Result<()> {
     let mut entries = load(app).unwrap_or_default();
     // Prune entries whose files no longer exist.
     entries.retain(|e| fs::metadata(&e.path).is_ok());
+    for entry in &mut entries {
+        enrich_entry_metadata(entry);
+    }
     app.manage(HistoryState(Mutex::new(entries)));
     Ok(())
 }
@@ -49,7 +72,13 @@ fn persist(app: &AppHandle, entries: &[HistoryEntry]) {
 
 pub fn entries(app: &AppHandle) -> Vec<HistoryEntry> {
     let state = app.state::<HistoryState>();
-    let inner = state.0.lock().unwrap();
+    let mut inner = state.0.lock().unwrap();
+    // Refresh any missing dimensions or sizes
+    for entry in inner.iter_mut() {
+        if entry.size_bytes == 0 || entry.width == 0 {
+            enrich_entry_metadata(entry);
+        }
+    }
     inner.clone()
 }
 
@@ -59,13 +88,15 @@ pub fn add(app: &AppHandle, path: String, captured_at: String) {
     let state = app.state::<HistoryState>();
     let mut inner = state.0.lock().unwrap();
     inner.retain(|e| e.path != path);
-    inner.insert(
-        0,
-        HistoryEntry {
-            path,
-            captured_at,
-        },
-    );
+    let mut new_entry = HistoryEntry {
+        path,
+        captured_at,
+        size_bytes: 0,
+        width: 0,
+        height: 0,
+    };
+    enrich_entry_metadata(&mut new_entry);
+    inner.insert(0, new_entry);
     inner.truncate(max);
     let snapshot = inner.clone();
     persist(app, &snapshot);
@@ -100,6 +131,9 @@ mod tests {
         let e = HistoryEntry {
             path: r"C:\Pictures\SnapDrop\SnapDrop_2026-08-24_145423.png".into(),
             captured_at: "2026-08-24T14:54:23".into(),
+            size_bytes: 1024,
+            width: 1920,
+            height: 1080,
         };
         let raw = serde_json::to_string(&e).unwrap();
         let back: HistoryEntry = serde_json::from_str(&raw).unwrap();

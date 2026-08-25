@@ -9,7 +9,11 @@ use crate::{clipboard, dragdrop, filename, history, hotkey, settings, thumbnail}
 
 #[tauri::command]
 pub fn get_settings(app: AppHandle) -> settings::Settings {
-    settings::get(&app)
+    let mut s = settings::get(&app);
+    s.screenshot_dir = filename::expand_dir(&s.screenshot_dir)
+        .to_string_lossy()
+        .to_string();
+    s
 }
 
 #[tauri::command]
@@ -90,12 +94,84 @@ pub fn open_folder(app: AppHandle) -> Result<(), String> {
 }
 
 pub fn open_folder_inner(app: &AppHandle) -> Result<(), String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowExW, GetWindowTextW, IsIconic, SetForegroundWindow, ShowWindow,
+        SwitchToThisWindow, SW_RESTORE,
+    };
+
     let dir = settings::resolved_dir(&settings::get(app));
     let dir_str = dir.to_string_lossy().to_string();
-    std::process::Command::new("explorer.exe")
-        .arg(&dir_str)
-        .spawn()
-        .map_err(|e| e.to_string())?;
+    let title = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "SnapDrop".to_string());
+
+    let wide_class: Vec<u16> = "CabinetWClass"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let find_folder_window = || -> Option<windows::Win32::Foundation::HWND> {
+        unsafe {
+            let mut after = windows::Win32::Foundation::HWND::default();
+            loop {
+                let h = FindWindowExW(
+                    None,
+                    Some(after),
+                    PCWSTR(wide_class.as_ptr()),
+                    PCWSTR::null(),
+                )
+                .ok()?;
+                if h.is_invalid() || h == after {
+                    return None;
+                }
+                let mut buf = [0u16; 512];
+                let len = GetWindowTextW(h, &mut buf);
+                if len > 0 {
+                    let valid_len = (len as usize).min(buf.len());
+                    let t = String::from_utf16_lossy(&buf[..valid_len]);
+                    if t.starts_with(&title) {
+                        return Some(h);
+                    }
+                }
+                after = h;
+            }
+        }
+    };
+
+    let activate = |h: windows::Win32::Foundation::HWND| unsafe {
+        if IsIconic(h).as_bool() {
+            let _ = ShowWindow(h, SW_RESTORE);
+        }
+        SwitchToThisWindow(h, true);
+        let _ = SetForegroundWindow(h);
+    };
+
+    if let Some(h) = find_folder_window() {
+        activate(h);
+        return Ok(());
+    }
+
+    // No existing Explorer window on that folder — open one
+    let wide_dir: Vec<u16> = dir_str.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let _ = windows::Win32::UI::Shell::ShellExecuteW(
+            None,
+            windows::core::w!("open"),
+            windows::core::PCWSTR(wide_dir.as_ptr()),
+            None,
+            None,
+            windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        );
+    }
+    for _ in 0..15 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Some(h) = find_folder_window() {
+            activate(h);
+            break;
+        }
+    }
     Ok(())
 }
 
@@ -135,6 +211,27 @@ pub fn copy_capture(_app: AppHandle, path: String) -> Result<(), String> {
 pub fn capture_now(app: AppHandle) -> Result<(), String> {
     hotkey::trigger_capture(&app);
     Ok(())
+}
+
+#[tauri::command]
+pub fn get_capture_preview(_app: AppHandle, path: String) -> Result<String, String> {
+    use base64::Engine;
+    let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+    // If small enough, just return as base64 png, or load and thumbnail
+    if let Ok(img) = image::load_from_memory(&bytes) {
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let mut bgra = Vec::with_capacity((w as usize) * (h as usize) * 4);
+        for px in rgba.pixels() {
+            bgra.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+        }
+        if let Some(png) = filename::preview_png(&bgra, w, h, 256) {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+            return Ok(format!("data:image/png;base64,{b64}"));
+        }
+    }
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:image/png;base64,{b64}"))
 }
 
 #[tauri::command]
@@ -240,9 +337,12 @@ pub fn reveal_in_explorer(path: &str) -> Result<(), String> {
                 }
                 let mut buf = [0u16; 512];
                 let len = GetWindowTextW(h, &mut buf);
-                let t = String::from_utf16_lossy(&buf[..len as usize]);
-                if t.starts_with(&title) {
-                    return Some(h);
+                if len > 0 {
+                    let valid_len = (len as usize).min(buf.len());
+                    let t = String::from_utf16_lossy(&buf[..valid_len]);
+                    if t.starts_with(&title) {
+                        return Some(h);
+                    }
                 }
                 after = h;
             }

@@ -20,6 +20,9 @@ export interface Settings {
 export interface HistoryEntry {
   path: string;
   captured_at: string;
+  size_bytes?: number;
+  width?: number;
+  height?: number;
 }
 
 export interface CapturedPayload {
@@ -59,4 +62,6 @@ export const api = {
   showSettings: () => invoke<void>("show_settings"),
   pickFolder: (current: string) =>
     invoke<string | null>("pick_folder", { current }),
+  getCapturePreview: (path: string) =>
+    invoke<string>("get_capture_preview", { path }),
 };
