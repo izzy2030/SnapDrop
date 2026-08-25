@@ -36,12 +36,21 @@ pub fn run() {
     let _ = env_logger::try_init();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            use tauri::Manager;
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
         .setup(|app| {
+            use tauri::Manager;
             settings::init(app.handle())?;
             history::init(app.handle())?;
             hotkey::init(app.handle());
@@ -49,6 +58,10 @@ pub fn run() {
             editor::init(app.handle());
             let _ = thumbnail::hide_all(app.handle());
             let _ = editor::hide(app.handle());
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
             Ok(())
         })
         .on_window_event(|window, event| {

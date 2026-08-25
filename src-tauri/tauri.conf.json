@@ -20,7 +20,7 @@
         "minHeight": 546,
         "center": true,
         "resizable": true,
-        "visible": false
+        "visible": true
       },
       {
         "label": "thumbnail",
