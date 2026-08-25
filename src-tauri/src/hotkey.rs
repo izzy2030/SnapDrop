@@ -18,7 +18,8 @@ static ESC_REGISTERED: AtomicBool = AtomicBool::new(false);
 pub struct CurrentShortcut(pub Mutex<Option<Shortcut>>);
 
 pub fn current(app: &AppHandle) -> Option<Shortcut> {
-    app.state::<CurrentShortcut>().0.lock().unwrap().clone()
+    app.try_state::<CurrentShortcut>()
+        .and_then(|s| s.inner().0.lock().unwrap().clone())
 }
 
 pub fn init(app: &AppHandle) {
@@ -80,7 +81,9 @@ pub fn apply_settings(app: &AppHandle, hotkey_str: &str) -> Result<(), String> {
 
     match app.global_shortcut().register(shortcut.clone()) {
         Ok(()) => {
-            *app.state::<CurrentShortcut>().0.lock().unwrap() = Some(shortcut);
+            if let Some(state) = app.try_state::<CurrentShortcut>() {
+                *state.inner().0.lock().unwrap() = Some(shortcut);
+            }
             Ok(())
         }
         Err(e) => {

@@ -73,55 +73,62 @@ fn persist(app: &AppHandle, entries: &[HistoryEntry]) {
 }
 
 pub fn entries(app: &AppHandle) -> Vec<HistoryEntry> {
-    let state = app.state::<HistoryState>();
-    let mut inner = state.0.lock().unwrap();
-    // Refresh any missing dimensions or sizes
-    for entry in inner.iter_mut() {
-        if entry.size_bytes == 0 || entry.width == 0 {
-            enrich_entry_metadata(entry);
+    if let Some(state) = app.try_state::<HistoryState>() {
+        let mut inner = state.inner().0.lock().unwrap();
+        for entry in inner.iter_mut() {
+            if entry.size_bytes == 0 || entry.width == 0 {
+                enrich_entry_metadata(entry);
+            }
         }
+        inner.clone()
+    } else {
+        load(app).unwrap_or_default()
     }
-    inner.clone()
 }
 
 /// Add a capture at the front of the stack, trimmed to the configured max.
 pub fn add(app: &AppHandle, path: String, captured_at: String) {
     let max = settings::get(app).max_history.max(1);
-    let state = app.state::<HistoryState>();
-    let mut inner = state.0.lock().unwrap();
-    inner.retain(|e| e.path != path);
-    let mut new_entry = HistoryEntry {
-        path,
-        captured_at,
-        size_bytes: 0,
-        width: 0,
-        height: 0,
-    };
-    enrich_entry_metadata(&mut new_entry);
-    inner.insert(0, new_entry);
-    inner.truncate(max);
-    let snapshot = inner.clone();
-    persist(app, &snapshot);
-}
-
-pub fn remove(app: &AppHandle, path: &str) -> bool {
-    let state = app.state::<HistoryState>();
-    let mut inner = state.0.lock().unwrap();
-    let before = inner.len();
-    inner.retain(|e| e.path != path);
-    let changed = inner.len() != before;
-    if changed {
+    if let Some(state) = app.try_state::<HistoryState>() {
+        let mut inner = state.inner().0.lock().unwrap();
+        inner.retain(|e| e.path != path);
+        let mut new_entry = HistoryEntry {
+            path,
+            captured_at,
+            size_bytes: 0,
+            width: 0,
+            height: 0,
+        };
+        enrich_entry_metadata(&mut new_entry);
+        inner.insert(0, new_entry);
+        inner.truncate(max);
         let snapshot = inner.clone();
         persist(app, &snapshot);
     }
-    changed
+}
+
+pub fn remove(app: &AppHandle, path: &str) -> bool {
+    if let Some(state) = app.try_state::<HistoryState>() {
+        let mut inner = state.inner().0.lock().unwrap();
+        let before = inner.len();
+        inner.retain(|e| e.path != path);
+        let changed = inner.len() != before;
+        if changed {
+            let snapshot = inner.clone();
+            persist(app, &snapshot);
+        }
+        changed
+    } else {
+        false
+    }
 }
 
 pub fn clear(app: &AppHandle) {
-    let state = app.state::<HistoryState>();
-    let mut inner = state.0.lock().unwrap();
-    inner.clear();
-    persist(app, &[]);
+    if let Some(state) = app.try_state::<HistoryState>() {
+        let mut inner = state.inner().0.lock().unwrap();
+        inner.clear();
+        persist(app, &[]);
+    }
 }
 
 #[cfg(test)]

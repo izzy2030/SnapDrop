@@ -79,9 +79,12 @@ fn load(app: &AppHandle) -> Option<Settings> {
 }
 
 pub fn get(app: &AppHandle) -> Settings {
-    let state = app.state::<SettingsState>();
-    let inner = state.0.lock().unwrap();
-    inner.clone()
+    if let Some(state) = app.try_state::<SettingsState>() {
+        let inner = state.inner().0.lock().unwrap();
+        inner.clone()
+    } else {
+        load(app).unwrap_or_default()
+    }
 }
 
 pub fn save(app: &AppHandle, settings: &Settings) -> Result<(), String> {
@@ -91,7 +94,11 @@ pub fn save(app: &AppHandle, settings: &Settings) -> Result<(), String> {
     }
     let raw = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
     fs::write(&path, raw).map_err(|e| e.to_string())?;
-    *app.state::<SettingsState>().0.lock().unwrap() = settings.clone();
+    if let Some(state) = app.try_state::<SettingsState>() {
+        *state.inner().0.lock().unwrap() = settings.clone();
+    } else {
+        app.manage(SettingsState(Mutex::new(settings.clone())));
+    }
     Ok(())
 }
 
