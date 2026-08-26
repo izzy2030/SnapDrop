@@ -16,6 +16,7 @@ mod thumbnail;
 mod tray;
 
 use std::sync::atomic::AtomicBool;
+use tauri::RunEvent;
 
 /// Global pause state for the capture hotkey (toggled from the tray).
 pub static PAUSED: AtomicBool = AtomicBool::new(false);
@@ -105,6 +106,11 @@ pub fn run() {
             commands::get_capture_preview,
             commands::get_latest_capture,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building SnapDrop application")
+        .run(|app, event| {
+            if matches!(event, RunEvent::Resumed) {
+                thumbnail::recover_after_resume(app);
+            }
+        });
 }

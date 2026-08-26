@@ -26,6 +26,7 @@ export interface HistoryEntry {
 }
 
 export interface CapturedPayload {
+  capture_id: number;
   path: string | null;
   preview: string; // data URL
   width: number;

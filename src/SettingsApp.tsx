@@ -178,7 +178,7 @@ export default function SettingsApp() {
     refreshHistory();
     api.getAppVersion().then(setVersion).catch(() => {});
 
-    const unCaptured = listen("captured", () => refreshHistory());
+    const unCaptured = listen("thumbnail-captured", () => refreshHistory());
     const unHistory = listen("history-updated", () => refreshHistory());
     const onFocus = () => refreshHistory();
     window.addEventListener("focus", onFocus);

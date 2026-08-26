@@ -97,12 +97,13 @@ pub fn show(
         width: img_w,
         height: img_h,
     };
-    let _ = w.emit("captured", payload.clone());
-    let _ = app.emit("captured", payload);
+    // Use an editor-specific event name so the thumbnail and settings windows
+    // cannot consume this different payload contract while the editor is shown.
+    let _ = app.emit("editor-captured", payload);
 }
 
 /// IPC command: the editor fetches the pending capture image on mount (in case
-/// the "captured" event was emitted before its listener was ready).
+/// the editor event was emitted before its listener was ready).
 pub fn get_pending_image() -> Option<EditorPayload> {
     let guard = PENDING.lock().unwrap();
     guard.as_ref().map(|p| EditorPayload {

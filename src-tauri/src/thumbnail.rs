@@ -1,13 +1,17 @@
 //! Floating thumbnail window: sizing, positioning, and capture events.
 
-use std::sync::Mutex;
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Size};
 
 use crate::{monitors, settings};
 
 #[derive(Serialize, Clone)]
 pub struct CapturedPayload {
+    /// Monotonic identity used by the thumbnail renderer to deduplicate event
+    /// replays and reconcile captures missed while the display was asleep.
+    pub capture_id: u64,
     /// None when the screenshot could not be saved (drag disabled, "not saved" state).
     pub path: Option<String>,
     /// data:image/png;base64,...
@@ -18,14 +22,28 @@ pub struct CapturedPayload {
 }
 
 static LATEST_CAPTURE: Mutex<Option<CapturedPayload>> = Mutex::new(None);
+static LAST_CAPTURE_CENTER: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+static NEXT_CAPTURE_ID: AtomicU64 = AtomicU64::new(1);
+/// Whether the latest thumbnail is expected to remain visible. This is kept
+/// separately from the native window state because Windows can lose that state
+/// while a display or WebView is being resumed.
+static THUMBNAIL_WANTED_VISIBLE: AtomicBool = AtomicBool::new(false);
+/// Invalidates delayed presentation retries when a capture starts or the user
+/// explicitly hides the thumbnail.
+static PRESENTATION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 pub fn get_latest_capture() -> Option<CapturedPayload> {
     LATEST_CAPTURE.lock().unwrap().clone()
 }
 
 pub fn hide_all(app: &AppHandle) -> Result<(), String> {
+    THUMBNAIL_WANTED_VISIBLE.store(false, Ordering::SeqCst);
+    PRESENTATION_GENERATION.fetch_add(1, Ordering::SeqCst);
     if let Some(w) = app.get_webview_window("thumbnail") {
-        let _ = w.hide();
+        w.hide().map_err(|e| {
+            log::warn!("thumbnail: hide failed: {e}");
+            e.to_string()
+        })?;
     }
     Ok(())
 }
@@ -37,15 +55,18 @@ pub fn is_visible(app: &AppHandle) -> bool {
 }
 
 pub fn set_visible(app: &AppHandle, visible: bool) -> Result<(), String> {
+    THUMBNAIL_WANTED_VISIBLE.store(visible, Ordering::SeqCst);
     if let Some(w) = app.get_webview_window("thumbnail") {
-        if visible {
-            let _ = w.show();
-        } else {
-            let _ = w.hide();
-        }
+        let result = if visible { w.show() } else { w.hide() };
+        result.map_err(|e| {
+            log::warn!("thumbnail: set visible={visible} failed: {e}");
+            e.to_string()
+        })?;
     }
     Ok(())
 }
+
+const MAX_PRESENT_RETRIES: u8 = 6;
 
 /// Show the thumbnail for a freshly captured screenshot.
 /// `sel_center` is the selection center in virtual-screen coords (used to pick the monitor).
@@ -63,13 +84,117 @@ pub fn show_capture(
         return;
     }
 
-    // Center of the selection → monitor for positioning.
-    let mon = monitors::monitor_at_point(sel_center.0, sel_center.1)
-        .or_else(|| monitors::monitor_at_point(0, 0));
-    let Some(mon) = mon else {
-        return;
+    // Store the payload before touching monitor state. Display enumeration can
+    // briefly fail while Windows is bringing a sleeping monitor back, but the
+    // capture itself has already been saved successfully by this point.
+    let payload = CapturedPayload {
+        capture_id: NEXT_CAPTURE_ID.fetch_add(1, Ordering::SeqCst),
+        path,
+        preview: format!("data:image/png;base64,{preview_b64}"),
+        width: img_w,
+        height: img_h,
+        unsaved,
     };
+    *LATEST_CAPTURE.lock().unwrap() = Some(payload.clone());
+    *LAST_CAPTURE_CENTER.lock().unwrap() = Some(sel_center);
+    THUMBNAIL_WANTED_VISIBLE.store(true, Ordering::SeqCst);
+    let generation = PRESENTATION_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
 
+    present_capture(app, payload, img_w, img_h, sel_center, generation, 0);
+}
+
+/// Apply the native window state and publish the payload. A failed native
+/// operation is retried on Tauri's main thread because WebView/DWM operations
+/// can transiently fail immediately after display wake or topology changes.
+fn present_capture(
+    app: &AppHandle,
+    payload: CapturedPayload,
+    img_w: u32,
+    img_h: u32,
+    sel_center: (i32, i32),
+    generation: u64,
+    attempt: u8,
+) {
+    if PRESENTATION_GENERATION.load(Ordering::SeqCst) != generation {
+        return;
+    }
+    let settings = settings::get(app);
+    if !settings.show_thumbnail {
+        return;
+    }
+
+    let (size, position) = thumbnail_geometry(&settings, img_w, img_h, sel_center);
+    let mut should_retry = false;
+
+    if let Some(w) = app.get_webview_window("thumbnail") {
+        if let Err(e) = w.set_size(Size::Physical(size)) {
+            log::warn!("thumbnail: set size failed (attempt {attempt}): {e}");
+            should_retry = true;
+        }
+        if let Some(position) = position {
+            if let Err(e) = w.set_position(position) {
+                log::warn!("thumbnail: set position failed (attempt {attempt}): {e}");
+                should_retry = true;
+            }
+        }
+        if let Err(e) = w.show() {
+            log::warn!("thumbnail: show failed (attempt {attempt}): {e}");
+            should_retry = true;
+        }
+        if !w.is_visible().unwrap_or(false) {
+            log::warn!("thumbnail: window still hidden after show (attempt {attempt})");
+            should_retry = true;
+        }
+        if let Err(e) = w.unminimize() {
+            log::warn!("thumbnail: unminimize failed (attempt {attempt}): {e}");
+            should_retry = true;
+        }
+        if let Err(e) = w.set_always_on_top(true) {
+            log::warn!("thumbnail: always-on-top failed (attempt {attempt}): {e}");
+            should_retry = true;
+        }
+        log::info!(
+            "thumbnail::show_capture pos={:?} size={}x{} path={:?} attempt={attempt}",
+            position,
+            size.width,
+            size.height,
+            payload.path
+        );
+    } else {
+        log::error!("thumbnail::show_capture: thumbnail window not found (attempt {attempt})");
+        should_retry = true;
+    }
+
+    // Keep the event for the Settings window's history refresh and for the
+    // thumbnail renderer. The renderer also reconciles from LATEST_CAPTURE,
+    // so a wake-time event delivery gap is harmless.
+    if let Err(e) = app.emit("thumbnail-captured", payload.clone()) {
+        log::warn!("thumbnail: captured event failed (attempt {attempt}): {e}");
+        should_retry = true;
+    }
+
+    if should_retry && attempt < MAX_PRESENT_RETRIES {
+        schedule_present_retry(
+            app,
+            payload,
+            img_w,
+            img_h,
+            sel_center,
+            generation,
+            attempt + 1,
+        );
+    }
+}
+
+/// Recalculate the monitor geometry on every retry. If no monitor is available
+/// momentarily, still show the window at a virtual-screen fallback position;
+/// a missing position must never suppress the thumbnail entirely.
+fn thumbnail_geometry(
+    settings: &settings::Settings,
+    img_w: u32,
+    img_h: u32,
+    sel_center: (i32, i32),
+) -> (PhysicalSize<u32>, Option<PhysicalPosition<i32>>) {
     let base = match settings.thumbnail_size.as_str() {
         "small" => 220,
         "large" => 420,
@@ -80,43 +205,111 @@ pub fn show_capture(
     } else {
         0.75
     };
-    let scale = mon.scale.max(1.0);
-    let win_w = (base as f32 * scale).round() as u32;
-    let win_h = ((base as f64 * aspect * scale as f64).round() as u32).clamp((120.0 * scale) as u32, (620.0 * scale) as u32);
-    let margin = (16.0 * scale).round() as i32;
 
-    // Position within the monitor's work area so the thumbnail never sits under the taskbar.
-    let (wl, wt, wr, wb) = (mon.work.left, mon.work.top, mon.work.right, mon.work.bottom);
-    let (wx, wy) = match settings.thumbnail_position.as_str() {
-        "top_left" => (wl + margin, wt + margin),
-        "top_right" => (wr - win_w as i32 - margin, wt + margin),
-        "bottom_left" => (wl + margin, wb - win_h as i32 - margin),
-        _ => (wr - win_w as i32 - margin, wb - win_h as i32 - margin),
-    };
+    let mon = monitors::monitor_at_point(sel_center.0, sel_center.1)
+        .or_else(|| monitors::monitor_at_point(0, 0))
+        .or_else(|| monitors::enumerate().into_iter().next());
 
-    let payload = CapturedPayload {
-        path: path.clone(),
-        preview: format!("data:image/png;base64,{preview_b64}"),
-        width: img_w,
-        height: img_h,
-        unsaved,
+    if let Some(mon) = mon {
+        let scale = mon.scale.max(1.0);
+        let margin = (16.0 * scale).round() as i32;
+        let work_w = (mon.work.right - mon.work.left - margin.saturating_mul(2)).max(1) as u32;
+        let work_h = (mon.work.bottom - mon.work.top - margin.saturating_mul(2)).max(1) as u32;
+        let desired_w = (base as f32 * scale).round().max(1.0) as u32;
+        let desired_h = (base as f64 * aspect * scale as f64).round().max(1.0) as u32;
+        let min_h = (120.0 * scale).round().max(1.0) as u32;
+        let win_w = desired_w.min(work_w).max(1);
+        let win_h = desired_h.max(min_h.min(work_h)).min(work_h).max(1);
+        let (wl, wt, wr, wb) = (mon.work.left, mon.work.top, mon.work.right, mon.work.bottom);
+        let left_bound = wl + margin;
+        let top_bound = wt + margin;
+        let right_bound = (wr - win_w as i32 - margin).max(left_bound);
+        let bottom_bound = (wb - win_h as i32 - margin).max(top_bound);
+        let (wx, wy) = match settings.thumbnail_position.as_str() {
+            "top_left" => (left_bound, top_bound),
+            "top_right" => (right_bound, top_bound),
+            "bottom_left" => (left_bound, bottom_bound),
+            _ => (right_bound, bottom_bound),
+        };
+        return (
+            PhysicalSize::new(win_w, win_h),
+            Some(PhysicalPosition::new(wx, wy)),
+        );
+    }
+
+    let win_w = base;
+    let win_h = (base as f64 * aspect).round().max(1.0) as u32;
+    let virt = monitors::virtual_screen();
+    let position = if virt.right > virt.left && virt.bottom > virt.top {
+        Some(PhysicalPosition::new(virt.left + 16, virt.top + 16))
+    } else {
+        log::warn!("thumbnail: monitor geometry unavailable; showing at current window position");
+        None
     };
-    *LATEST_CAPTURE.lock().unwrap() = Some(payload.clone());
+    (PhysicalSize::new(win_w, win_h), position)
+}
+
+fn schedule_present_retry(
+    app: &AppHandle,
+    payload: CapturedPayload,
+    img_w: u32,
+    img_h: u32,
+    sel_center: (i32, i32),
+    generation: u64,
+    attempt: u8,
+) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let delay_ms = 100u64 << (attempt.saturating_sub(1).min(5));
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        let app_for_main = app.clone();
+        let result = app.run_on_main_thread(move || {
+            present_capture(
+                &app_for_main,
+                payload,
+                img_w,
+                img_h,
+                sel_center,
+                generation,
+                attempt,
+            );
+        });
+        if let Err(e) = result {
+            log::warn!("thumbnail: could not schedule presentation retry: {e}");
+        }
+    });
+}
+
+/// Rebuild the thumbnail WebView's state after the application/display resumes.
+/// The native window may still exist but its renderer can have missed events or
+/// retained stale visibility/position state across a long sleep.
+pub fn recover_after_resume(app: &AppHandle) {
+    if !THUMBNAIL_WANTED_VISIBLE.load(Ordering::SeqCst) {
+        return;
+    }
+    let Some(payload) = get_latest_capture() else {
+        return;
+    };
+    let center = LAST_CAPTURE_CENTER.lock().unwrap().unwrap_or((0, 0));
+    let generation = PRESENTATION_GENERATION.load(Ordering::SeqCst);
+    if generation == 0 {
+        return;
+    }
 
     if let Some(w) = app.get_webview_window("thumbnail") {
-        let _ = w.set_size(Size::Physical(PhysicalSize::new(win_w, win_h)));
-        let _ = w.set_position(PhysicalPosition::new(wx, wy));
-        let _ = w.show();
-        let _ = w.unminimize();
-        let _ = w.set_always_on_top(true);
-        log::info!(
-            "thumbnail::show_capture pos=({wx},{wy}) size={win_w}x{win_h} path={:?}",
-            path
-        );
-        let _ = app.emit("captured", payload);
-    } else {
-        log::error!("thumbnail::show_capture: thumbnail window not found");
+        if let Err(e) = w.reload() {
+            log::warn!("thumbnail: reload after resume failed: {e}");
+        }
     }
+    present_capture(
+        app,
+        payload.clone(),
+        payload.width,
+        payload.height,
+        center,
+        generation,
+        0,
+    );
 }
 
 /// Show the thumbnail for an existing file (tray "Recent Captures").
@@ -141,7 +334,10 @@ pub fn show_capture_for_at(app: &AppHandle, path: &str, sel_center: Option<(i32,
         (w, h)
     } else {
         let s = max_dim as f64 / w.max(h) as f64;
-        (((w as f64 * s).round() as u32).max(1), ((h as f64 * s).round() as u32).max(1))
+        (
+            ((w as f64 * s).round() as u32).max(1),
+            ((h as f64 * s).round() as u32).max(1),
+        )
     };
     // `thumbnail()` preserves aspect ratio and may return a slightly smaller image
     // than the requested `tw`/`th` (e.g. 511×421 vs 512×421 due to rounding), so
@@ -165,4 +361,23 @@ pub fn show_capture_for_at(app: &AppHandle, path: &str, sel_center: Option<(i32,
     let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
     let center = sel_center.unwrap_or(((w / 2) as i32, (h / 2) as i32));
     show_capture(app, Some(path.to_string()), b64, w, h, false, center);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_payload_serializes_identity_for_reconciliation() {
+        let payload = CapturedPayload {
+            capture_id: 42,
+            path: Some(r"C:\\Pictures\\SnapDrop\\capture.png".into()),
+            preview: "data:image/png;base64,preview".into(),
+            width: 100,
+            height: 80,
+            unsaved: false,
+        };
+        let json = serde_json::to_value(payload).unwrap();
+        assert_eq!(json.get("capture_id").and_then(|v| v.as_u64()), Some(42));
+    }
 }

@@ -54,8 +54,8 @@ function EditorApp() {
   }, []);
 
   // Load the captured image: pull it via IPC on mount (reliable even if the
-  // webview wasn't ready when the "captured" event was emitted), and also
-  // listen for the event as a backup.
+  // webview wasn't ready when the editor event was emitted), and also
+  // listen for the editor-scoped event as a backup.
   const loadImage = useCallback((src: string) => {
     const img = new Image();
     img.onload = () => {
@@ -85,7 +85,7 @@ function EditorApp() {
     ).then((p) => {
       if (p && p.full) loadImage(p.full);
     });
-    const un = listen<{ full: string; width: number; height: number }>("captured", (e) => {
+    const un = listen<{ full: string; width: number; height: number }>("editor-captured", (e) => {
       loadImage(e.payload.full);
     });
     return () => {

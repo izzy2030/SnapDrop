@@ -4,6 +4,7 @@ import { api, CapturedPayload, ToastPayload } from "./api";
 
 interface StackItem {
   key: number;
+  captureId: number;
   path: string | null;
   preview: string;
   width: number;
@@ -12,6 +13,18 @@ interface StackItem {
 }
 
 let nextKey = 1;
+
+function toStackItem(p: CapturedPayload): StackItem {
+  return {
+    key: nextKey++,
+    captureId: p.capture_id,
+    path: p.path,
+    preview: p.preview,
+    width: p.width,
+    height: p.height,
+    unsaved: p.unsaved,
+  };
+}
 
 function fileName(p: string) {
   return p.split(/[\\/]/).pop() ?? p;
@@ -23,30 +36,43 @@ export default function ThumbnailApp() {
   const [toast, setToast] = useState<ToastPayload | null>(null);
   const toastTimer = useRef<number | null>(null);
   const lastClickRef = useRef(0);
+  const seenCaptureIdsRef = useRef(new Set<number>());
+  const dismissedCaptureIdsRef = useRef(new Set<number>());
 
   const removeFromStack = useCallback((path: string) => {
-    setStack((s) => s.filter((i) => i.path !== path));
+    setStack((s) => {
+      const removed = s.filter((item) => item.path === path);
+      for (const item of removed) {
+        dismissedCaptureIdsRef.current.add(item.captureId);
+      }
+      return s.filter((item) => item.path !== path);
+    });
+  }, []);
+
+  const addCapture = useCallback((p: CapturedPayload) => {
+    const id = p.capture_id;
+    if (!p.preview || !Number.isSafeInteger(id) || id <= 0) return;
+    if (dismissedCaptureIdsRef.current.has(id) || seenCaptureIdsRef.current.has(id)) return;
+    seenCaptureIdsRef.current.add(id);
+    setStack((s) => [toStackItem(p), ...s].slice(0, 10));
+    setExpanded(false);
   }, []);
 
   useEffect(() => {
-    // Check for pending/latest capture on mount
-    api.getLatestCapture()
-      .then((p) => {
-        if (p && p.preview) {
-          setStack((s) => {
-            if (s.length > 0) return s;
-            return [{ key: nextKey++, path: p.path, preview: p.preview, width: p.width, height: p.height, unsaved: p.unsaved }];
-          });
-        }
-      })
-      .catch(() => {});
+    // Reconcile from the backend as well as listening for events. A renderer
+    // can miss a one-shot event while WebView2 is resuming after display sleep.
+    const reconcileLatest = () => {
+      void api.getLatestCapture()
+        .then((p) => {
+          if (p) addCapture(p);
+        })
+        .catch(() => {});
+    };
+    reconcileLatest();
+    const reconcileTimer = window.setInterval(reconcileLatest, 1500);
 
-    const unCaptured = listen<CapturedPayload>("captured", (e) => {
-      const p = e.payload;
-      setStack((s) =>
-        [{ key: nextKey++, path: p.path, preview: p.preview, width: p.width, height: p.height, unsaved: p.unsaved }, ...s].slice(0, 10),
-      );
-      setExpanded(false);
+    const unCaptured = listen<CapturedPayload>("thumbnail-captured", (e) => {
+      addCapture(e.payload);
     });
     const unToast = listen<ToastPayload>("toast", (e) => {
       setToast(e.payload);
@@ -54,10 +80,11 @@ export default function ThumbnailApp() {
       toastTimer.current = window.setTimeout(() => setToast(null), 4000);
     });
     return () => {
+      window.clearInterval(reconcileTimer);
       unCaptured.then((f) => f());
       unToast.then((f) => f());
     };
-  }, []);
+  }, [addCapture]);
 
   // Auto-dismiss per settings.
   useEffect(() => {
