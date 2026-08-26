@@ -41,7 +41,11 @@ fn run_inner(app: &AppHandle) {
     // Brief sleep to ensure DWM compositor updates the screen before capture overlay starts
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    let sel = match overlay::run() {
+    // Snapshot settings up front: the overlay needs the editor toggle to label
+    // its Ctrl hint, and nothing here changes mid-capture.
+    let settings = settings::get(app);
+
+    let sel = match overlay::run(settings.show_editor_after_capture) {
         Some(s) => s,
         None => {
             // Cancelled — restore whatever was hidden.
@@ -65,7 +69,6 @@ fn run_inner(app: &AppHandle) {
         return;
     };
 
-    let settings = settings::get(app);
     let dir = settings::resolved_dir(&settings);
     // Notify when the configured folder was unusable and we fell back to the default.
     if filename::expand_dir(&settings.screenshot_dir) != dir {
@@ -122,7 +125,11 @@ fn run_inner(app: &AppHandle) {
         (sel.rect.top + monitors::rect_height(&sel.rect) / 2),
     );
 
-    if settings.show_editor_after_capture {
+    // Ctrl flips the editor decision from the setting (XOR): with the editor
+    // enabled, holding Ctrl while dragging skips it and goes straight to the
+    // thumbnail; with the editor disabled, holding Ctrl opens it for that
+    // capture. The screenshot is already saved by this point either way.
+    if settings.show_editor_after_capture != sel.ctrl_held {
         // Pause with the annotation editor; Enter confirms, Esc cancels. Either
         // way the editor's event handler closes it and shows the thumbnail.
         let full_b64 = match filename::encode_png(&img.bgra, img.width, img.height) {

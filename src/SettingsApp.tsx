@@ -835,7 +835,7 @@ export default function SettingsApp() {
                   <div className="field-row" style={{ marginTop: 12 }}>
                     <div>
                       <span className="field-label">Annotate before showing thumbnail</span>
-                      <div className="field-hint">Open drawing overlay immediately after region capture.</div>
+                      <div className="field-hint">Hold Ctrl while selecting to do the opposite: skip the editor when this is on, open it when off.</div>
                     </div>
                     <input
                       type="checkbox"

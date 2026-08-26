@@ -9,10 +9,11 @@ Built with **Tauri 2** (React + TypeScript frontend, Rust backend). Windows 10/1
 ## Workflow
 
 1. Press `Ctrl + Shift + 4` (configurable).
-2. Drag a selection rectangle over the screen (Esc cancels).
-3. An annotation editor appears over the captured area: pen, highlighter, arrow,
-   rectangle, undo, color picker. Press **Enter** to confirm (the annotated image
-   replaces the original file) or **Esc** to skip annotations.
+2. Drag a selection rectangle over the screen (Esc cancels). Hold **Ctrl** while
+   dragging to skip annotations entirely and go straight to the thumbnail.
+3. Otherwise, an annotation editor appears over the captured area: pen,
+   highlighter, arrow, rectangle, undo, color picker. Press **Enter** to confirm
+   (the annotated image replaces the original file) or **Esc** to skip annotations.
 4. A floating thumbnail appears in the bottom-left corner of the monitor.
 5. Grab the thumbnail and drop it into any app that accepts files — it receives the PNG
    exactly as if it were dragged from Explorer. (Press, then move; a plain click on the

@@ -21,7 +21,7 @@ The goal is to eliminate every unnecessary step between capturing a screenshot a
 
 1. **Global hotkey capture** (`Ctrl+Shift+4`, configurable) — works while SnapDrop runs in the background
 2. **Region capture** across multiple monitors with correct physical-pixel coordinates (Per-Monitor v2 DPI awareness)
-3. **Annotation editor** — pauses after capture with a drawing toolbar (pen, highlighter, arrow, rectangle, undo) before showing the thumbnail. Enter confirms, Esc skips.
+3. **Annotation editor** — pauses after capture with a drawing toolbar (pen, highlighter, arrow, rectangle, undo) before showing the thumbnail. Enter confirms, Esc skips. **Ctrl flips the editor decision from the setting**: with the editor enabled, hold Ctrl while dragging to skip it; with it disabled, hold Ctrl to open it for that capture.
 4. **Floating thumbnail** — transparent, always-on-top, positioned in the bottom-left corner of the capture monitor, inside the work area (clear of the taskbar)
 5. **Native drag-and-drop** — the defining feature. COM `IDataObject` (CF_HDROP) + `IDropSource` + `DoDragDrop` with a shell drag image. External apps receive the screenshot as a real PNG file drop. Runs on the main UI thread (Chromium/WebView2 apps require this).
 6. **Clipboard** — screenshots are copied to clipboard (CF_DIBV5 + CF_HDROP) immediately after capture, so `Ctrl+V` works too
@@ -126,7 +126,7 @@ copy to clipboard (CF_DIBV5 + CF_HDROP)
     ↓
 add to history
     ↓
-if show_editor_after_capture:
+if editor enabled XOR Ctrl held during selection:
     encode full PNG → editor::show → show editor window
     ↓
     user annotates → Enter confirms

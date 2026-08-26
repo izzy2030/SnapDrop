@@ -18,12 +18,14 @@ use windows::Win32::Graphics::Gdi::{
     FF_DONTCARE, FW_NORMAL, HBITMAP, HDC, OUT_DEFAULT_PRECIS, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_ESCAPE,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
     LoadCursorW, PostMessageW, RegisterClassExW, SetForegroundWindow, ShowWindow, TranslateMessage,
     UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, IDC_CROSS, MSG, SW_SHOW, ULW_ALPHA, WM_APP,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WNDCLASSEXW, WS_EX_LAYERED,
+    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WNDCLASSEXW, WS_EX_LAYERED,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
@@ -33,6 +35,11 @@ use crate::monitors::{self, MonitorInfo};
 /// thread just before the loop; cleared after). Lets the global Esc hotkey
 /// dismiss the overlay even when the overlay window has no keyboard focus.
 pub static RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Snapshot of the "annotate before showing thumbnail" setting, used to label
+/// the Ctrl modifier correctly in the overlay hints ("skip editor" vs
+/// "annotate"). Set once per capture before the overlay starts.
+static EDITOR_ENABLED: AtomicBool = AtomicBool::new(true);
 
 const CLASS_NAME: &str = "SnapDropOverlayClass";
 const WM_OVERLAY_DONE: u32 = WM_APP + 1;
@@ -45,6 +52,10 @@ const BORDER_T: usize = 2;
 #[derive(Clone, Copy, Debug)]
 pub struct Selection {
     pub rect: RECT,
+    /// True when Ctrl was held while the selection was being dragged. The
+    /// capture flow flips the editor decision from the current setting: with
+    /// the editor enabled Ctrl skips it, with it disabled Ctrl opens it.
+    pub ctrl_held: bool,
 }
 
 struct OverlayState {
@@ -178,11 +189,15 @@ unsafe fn overlay_wndproc_inner(
                         && monitors::rect_height(&r) >= MIN_SELECTION
                 })
                 .unwrap_or(false);
+            let ctrl_held = is_ctrl_down();
             {
                 let mut st = lock_state();
                 st.done = true;
                 st.result = Some(if ok {
-                    Some(Selection { rect: sel.unwrap() })
+                    Some(Selection {
+                        rect: sel.unwrap(),
+                        ctrl_held,
+                    })
                 } else {
                     None
                 });
@@ -192,6 +207,12 @@ unsafe fn overlay_wndproc_inner(
         }
         WM_KEYDOWN if wparam.0 as u32 == VK_ESCAPE.0 as u32 => {
             cancel();
+            LRESULT(0)
+        }
+        // Refresh the live "skip editor" cue when Ctrl is pressed/released while
+        // the overlay holds focus (mouse moves refresh it even without focus).
+        WM_KEYDOWN | WM_KEYUP if wparam.0 as u32 == VK_CONTROL.0 as u32 => {
+            redraw();
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -205,6 +226,13 @@ fn cancel() {
         st.result = Some(None);
         wake_loop(st.hwnd);
     }
+}
+
+/// Whether the Ctrl key is physically held down right now. Uses
+/// GetAsyncKeyState so it works even when the overlay can't take keyboard
+/// focus (a background app can't always steal the foreground).
+fn is_ctrl_down() -> bool {
+    unsafe { (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16) & 0x8000 != 0 }
 }
 
 /// Dismiss the overlay from outside the window proc (e.g. the global Esc
@@ -240,7 +268,10 @@ fn make_selection(a: POINT, b: POINT) -> RECT {
 }
 
 /// Run the capture overlay. Returns the selection (virtual-screen coords) or None if cancelled.
-pub fn run() -> Option<Selection> {
+/// `editor_enabled` is the current "annotate before showing thumbnail" setting;
+/// the overlay uses it to label the Ctrl modifier correctly.
+pub fn run(editor_enabled: bool) -> Option<Selection> {
+    EDITOR_ENABLED.store(editor_enabled, Ordering::SeqCst);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_inner));
     match result {
         Ok(sel) => sel,
@@ -425,14 +456,22 @@ fn redraw() {
             }
         }
 
-        // Dimension readout.
+        // Dimension readout, with a live "skip editor" cue while Ctrl is held.
         let rw = monitors::rect_width(&rect);
         let rh = monitors::rect_height(&rect);
-        let text = format!(
+        let mut text = format!(
             "{} × {}",
             (rw as f32 / scale).round() as i64,
             (rh as f32 / scale).round() as i64
         );
+        if is_ctrl_down() {
+            let cue = if EDITOR_ENABLED.load(Ordering::SeqCst) {
+                "   •   Ctrl: skip editor"
+            } else {
+                "   •   Ctrl: annotate"
+            };
+            text.push_str(cue);
+        }
         let y_pos = if rect.top - virt.top < 60 {
             rect.bottom + 10
         } else {
@@ -456,7 +495,11 @@ fn redraw() {
             &virt,
             virt.left + w as i32 / 2,
             virt.top + 28,
-            "Drag to select   •   Esc to cancel",
+            if EDITOR_ENABLED.load(Ordering::SeqCst) {
+                "Drag to select   •   Esc to cancel   •   Ctrl: skip editor"
+            } else {
+                "Drag to select   •   Esc to cancel   •   Ctrl: annotate"
+            },
         );
     }
 
