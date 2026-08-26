@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::settings;
 
@@ -104,6 +104,7 @@ pub fn add(app: &AppHandle, path: String, captured_at: String) {
         inner.truncate(max);
         let snapshot = inner.clone();
         persist(app, &snapshot);
+        let _ = app.emit("history-updated", ());
     }
 }
 
@@ -116,6 +117,7 @@ pub fn remove(app: &AppHandle, path: &str) -> bool {
         if changed {
             let snapshot = inner.clone();
             persist(app, &snapshot);
+            let _ = app.emit("history-updated", ());
         }
         changed
     } else {
@@ -128,6 +130,7 @@ pub fn clear(app: &AppHandle) {
         let mut inner = state.inner().0.lock().unwrap();
         inner.clear();
         persist(app, &[]);
+        let _ = app.emit("history-updated", ());
     }
 }
 

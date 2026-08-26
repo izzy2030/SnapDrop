@@ -58,14 +58,39 @@ pub fn init(app: &AppHandle) {
 }
 
 /// Request a capture. Runs the full flow on the main thread with a reentrancy guard.
+///
+/// The global-hotkey handler fires synchronously inside the `global_hotkey_app`
+/// window proc (`extern "system"`) on the main thread, and Tauri's
+/// `run_on_main_thread` executes tasks **inline** when called from the main
+/// thread. Running the capture flow (overlay nested message loop, capture,
+/// save, clipboard) in that context means any Rust panic unwinds through the
+/// extern wndproc and aborts the whole process — the classic "panic in a
+/// function that cannot unwind" / 0xc0000409 crash. So we hop off the main
+/// thread first: the task is then delivered back through tao's event loop,
+/// where it runs in a safe context and is additionally guarded by
+/// `catch_unwind` so a panic degrades to a toast instead of killing the app.
 pub fn trigger_capture(app: &AppHandle) {
     if CAPTURING.swap(true, Ordering::SeqCst) {
         return;
     }
     let app2 = app.clone();
-    let _ = app.run_on_main_thread(move || {
-        capture_flow::run(&app2);
-        CAPTURING.store(false, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        let app3 = app2.clone();
+        let sent = app2.run_on_main_thread(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                capture_flow::run(&app3);
+            }));
+            if let Err(payload) = result {
+                log::error!("capture flow panicked: {}", crate::panic_message(&payload));
+                let _ = notifier::toast(&app3, "error", "Capture failed unexpectedly");
+            }
+            CAPTURING.store(false, Ordering::SeqCst);
+        });
+        // If the event loop is gone (app shutting down) the task never runs;
+        // release the reentrancy guard so the flag can't get stuck.
+        if sent.is_err() {
+            CAPTURING.store(false, Ordering::SeqCst);
+        }
     });
 }
 
@@ -125,11 +150,21 @@ pub fn register_esc_hotkey(app: &AppHandle) {
         if event.state() != ShortcutState::Pressed {
             return;
         }
-        if crate::editor::is_visible(app) {
-            let _ = app.emit("editor-cancelled", ());
-        } else if crate::thumbnail::is_visible(app) {
-            let _ = crate::thumbnail::hide_all(app);
-        }
+        // Runs inside the global-hotkey window proc (extern fn), so guard
+        // against panics that would otherwise abort the process.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // First priority: dismiss the capture overlay. It runs a nested
+            // message loop on the main thread and may not hold keyboard focus
+            // (a background app can't always steal the foreground), so the
+            // overlay's own WM_KEYDOWN never sees Esc — without this the app
+            // would stay dimmed and frozen until clicked.
+            crate::overlay::cancel_if_running();
+            if crate::editor::is_visible(app) {
+                let _ = app.emit("editor-cancelled", ());
+            } else if crate::thumbnail::is_visible(app) {
+                let _ = crate::thumbnail::hide_all(app);
+            }
+        }));
     }) {
         Ok(()) => log::info!("esc hotkey registered (dismiss)"),
         Err(e) => {

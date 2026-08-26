@@ -89,15 +89,16 @@ pub fn show(
     }
 
     let _ = w.show();
+    let _ = w.unminimize();
+    let _ = w.set_always_on_top(true);
     let _ = w.set_focus();
-    let _ = w.emit(
-        "captured",
-        EditorPayload {
-            full: format!("data:image/png;base64,{full_b64}"),
-            width: img_w,
-            height: img_h,
-        },
-    );
+    let payload = EditorPayload {
+        full: format!("data:image/png;base64,{full_b64}"),
+        width: img_w,
+        height: img_h,
+    };
+    let _ = w.emit("captured", payload.clone());
+    let _ = app.emit("captured", payload);
 }
 
 /// IPC command: the editor fetches the pending capture image on mount (in case

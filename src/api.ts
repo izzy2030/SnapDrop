@@ -64,4 +64,5 @@ export const api = {
     invoke<string | null>("pick_folder", { current }),
   getCapturePreview: (path: string) =>
     invoke<string>("get_capture_preview", { path }),
+  getLatestCapture: () => invoke<CapturedPayload | null>("get_latest_capture"),
 };

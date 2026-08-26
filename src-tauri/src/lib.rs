@@ -20,6 +20,17 @@ use std::sync::atomic::AtomicBool;
 /// Global pause state for the capture hotkey (toggled from the tray).
 pub static PAUSED: AtomicBool = AtomicBool::new(false);
 
+/// Extract a human-readable message from a panic payload.
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
 pub fn init_dpi() {
     dpi::set_per_monitor_dpi_awareness();
 }
@@ -92,6 +103,7 @@ pub fn run() {
             commands::show_settings,
             commands::pick_folder,
             commands::get_capture_preview,
+            commands::get_latest_capture,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

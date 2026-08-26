@@ -8,6 +8,24 @@ use crate::{
 };
 
 pub fn run(app: &AppHandle) {
+    // The capture flow may run inside a message dispatch on the main thread;
+    // contain any panic so it degrades to an error toast instead of killing
+    // the process, and restore the windows the flow hides so the app is never
+    // left in a broken state.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_inner(app)));
+    if let Err(payload) = result {
+        log::error!("capture flow panicked: {}", crate::panic_message(&payload));
+        if let Some(main_win) = app.get_webview_window("main") {
+            let _ = main_win.show();
+        }
+        if let Some(thumb) = app.get_webview_window("thumbnail") {
+            let _ = thumb.show();
+        }
+        notifier::toast(app, "error", "Capture failed unexpectedly");
+    }
+}
+
+fn run_inner(app: &AppHandle) {
     // Hide main window and floating thumbnails so they never appear in the capture.
     let main_was_visible = app
         .get_webview_window("main")

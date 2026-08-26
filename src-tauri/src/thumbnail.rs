@@ -1,5 +1,6 @@
 //! Floating thumbnail window: sizing, positioning, and capture events.
 
+use std::sync::Mutex;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Size};
 
@@ -14,6 +15,12 @@ pub struct CapturedPayload {
     pub width: u32,
     pub height: u32,
     pub unsaved: bool,
+}
+
+static LATEST_CAPTURE: Mutex<Option<CapturedPayload>> = Mutex::new(None);
+
+pub fn get_latest_capture() -> Option<CapturedPayload> {
+    LATEST_CAPTURE.lock().unwrap().clone()
 }
 
 pub fn hide_all(app: &AppHandle) -> Result<(), String> {
@@ -73,9 +80,10 @@ pub fn show_capture(
     } else {
         0.75
     };
-    let win_w = base;
-    let win_h = ((base as f64 * aspect).round() as u32).clamp(120, 620);
-    let margin = 16i32;
+    let scale = mon.scale.max(1.0);
+    let win_w = (base as f32 * scale).round() as u32;
+    let win_h = ((base as f64 * aspect * scale as f64).round() as u32).clamp((120.0 * scale) as u32, (620.0 * scale) as u32);
+    let margin = (16.0 * scale).round() as i32;
 
     // Position within the monitor's work area so the thumbnail never sits under the taskbar.
     let (wl, wt, wr, wb) = (mon.work.left, mon.work.top, mon.work.right, mon.work.bottom);
@@ -86,25 +94,26 @@ pub fn show_capture(
         _ => (wr - win_w as i32 - margin, wb - win_h as i32 - margin),
     };
 
+    let payload = CapturedPayload {
+        path: path.clone(),
+        preview: format!("data:image/png;base64,{preview_b64}"),
+        width: img_w,
+        height: img_h,
+        unsaved,
+    };
+    *LATEST_CAPTURE.lock().unwrap() = Some(payload.clone());
+
     if let Some(w) = app.get_webview_window("thumbnail") {
         let _ = w.set_size(Size::Physical(PhysicalSize::new(win_w, win_h)));
         let _ = w.set_position(PhysicalPosition::new(wx, wy));
-        let shown = w.show();
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_always_on_top(true);
         log::info!(
-            "thumbnail::show_capture pos=({wx},{wy}) size={win_w}x{win_h} show={:?} path={:?}",
-            shown.as_ref().map(|_| "ok"),
+            "thumbnail::show_capture pos=({wx},{wy}) size={win_w}x{win_h} path={:?}",
             path
         );
-        let _ = w.emit(
-            "captured",
-            CapturedPayload {
-                path,
-                preview: format!("data:image/png;base64,{preview_b64}"),
-                width: img_w,
-                height: img_h,
-                unsaved,
-            },
-        );
+        let _ = app.emit("captured", payload);
     } else {
         log::error!("thumbnail::show_capture: thumbnail window not found");
     }

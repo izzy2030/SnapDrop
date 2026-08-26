@@ -5,7 +5,8 @@
 //! All coordinates are physical pixels in virtual-screen space.
 
 use std::mem::size_of;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -27,6 +28,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::monitors::{self, MonitorInfo};
+
+/// True while the overlay's nested message loop is running (set on the main
+/// thread just before the loop; cleared after). Lets the global Esc hotkey
+/// dismiss the overlay even when the overlay window has no keyboard focus.
+pub static RUNNING: AtomicBool = AtomicBool::new(false);
 
 const CLASS_NAME: &str = "SnapDropOverlayClass";
 const WM_OVERLAY_DONE: u32 = WM_APP + 1;
@@ -57,6 +63,12 @@ struct OverlayState {
 
 // Only ever touched on the main thread (nested loop during capture).
 unsafe impl Send for OverlayState {}
+
+/// Lock the overlay state, recovering from a poisoned mutex if an earlier
+/// panic was caught while the guard was held (see `overlay_wndproc`).
+fn lock_state() -> MutexGuard<'static, OverlayState> {
+    state().lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn state() -> &'static Mutex<OverlayState> {
     static STATE: OnceLock<Mutex<OverlayState>> = OnceLock::new();
@@ -108,11 +120,34 @@ unsafe extern "system" fn overlay_wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // This proc is an `extern "system"` callback: a Rust panic here cannot
+    // unwind across the FFI boundary and would abort the whole process with
+    // "panic in a function that cannot unwind" (0xc0000409). Catch and contain
+    // any panic, then cancel the overlay so the screen is never left dimmed.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        overlay_wndproc_inner(hwnd, msg, wparam, lparam)
+    }));
+    match result {
+        Ok(lres) => lres,
+        Err(payload) => {
+            log::error!("overlay wndproc panicked: {}", crate::panic_message(&payload));
+            cancel();
+            LRESULT(0)
+        }
+    }
+}
+
+unsafe fn overlay_wndproc_inner(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match msg {
         WM_LBUTTONDOWN => {
             let pos = cursor_pos();
             {
-                let mut st = state().lock().unwrap();
+                let mut st = lock_state();
                 st.start = Some(pos);
                 st.cur = pos;
                 let _ = SetCapture(hwnd);
@@ -123,7 +158,7 @@ unsafe extern "system" fn overlay_wndproc(
         WM_MOUSEMOVE => {
             let pos = cursor_pos();
             {
-                let mut st = state().lock().unwrap();
+                let mut st = lock_state();
                 if st.start.is_some() {
                     st.cur = pos;
                 }
@@ -134,7 +169,7 @@ unsafe extern "system" fn overlay_wndproc(
         WM_LBUTTONUP => {
             let _ = ReleaseCapture();
             let sel = {
-                let st = state().lock().unwrap();
+                let st = lock_state();
                 st.start.map(|s| make_selection(s, st.cur))
             };
             let ok = sel
@@ -144,7 +179,7 @@ unsafe extern "system" fn overlay_wndproc(
                 })
                 .unwrap_or(false);
             {
-                let mut st = state().lock().unwrap();
+                let mut st = lock_state();
                 st.done = true;
                 st.result = Some(if ok {
                     Some(Selection { rect: sel.unwrap() })
@@ -164,11 +199,20 @@ unsafe extern "system" fn overlay_wndproc(
 }
 
 fn cancel() {
-    let mut st = state().lock().unwrap();
+    let mut st = lock_state();
     if !st.done {
         st.done = true;
         st.result = Some(None);
         wake_loop(st.hwnd);
+    }
+}
+
+/// Dismiss the overlay from outside the window proc (e.g. the global Esc
+/// hotkey handler). No-op when no overlay is active.
+pub fn cancel_if_running() {
+    if RUNNING.load(Ordering::SeqCst) {
+        log::info!("overlay: cancel requested via global hotkey");
+        cancel();
     }
 }
 
@@ -197,6 +241,17 @@ fn make_selection(a: POINT, b: POINT) -> RECT {
 
 /// Run the capture overlay. Returns the selection (virtual-screen coords) or None if cancelled.
 pub fn run() -> Option<Selection> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_inner));
+    match result {
+        Ok(sel) => sel,
+        Err(payload) => {
+            log::error!("overlay::run panicked: {}", crate::panic_message(&payload));
+            None
+        }
+    }
+}
+
+fn run_inner() -> Option<Selection> {
     let monitors = monitors::enumerate();
     if monitors.is_empty() {
         return None;
@@ -265,7 +320,7 @@ pub fn run() -> Option<Selection> {
         let _ = SelectObject(mem_dc, bmp.into());
 
         {
-            let mut st = state().lock().unwrap();
+            let mut st = lock_state();
             st.hwnd = hwnd;
             st.width = w;
             st.height = h;
@@ -286,6 +341,9 @@ pub fn run() -> Option<Selection> {
         redraw();
 
         // Nested message loop. Never post WM_QUIT — this is Tauri's main thread.
+        // While it runs, the overlay is "active": the global Esc hotkey calls
+        // `cancel_if_running` to dismiss it even without keyboard focus.
+        RUNNING.store(true, Ordering::SeqCst);
         let mut msg = MSG::default();
         loop {
             let b = GetMessageW(&mut msg, None, 0, 0);
@@ -297,17 +355,18 @@ pub fn run() -> Option<Selection> {
             }
             let _ = TranslateMessage(&msg);
             let _ = DispatchMessageW(&msg);
-            if state().lock().unwrap().done {
+            if lock_state().done {
                 break;
             }
         }
+        RUNNING.store(false, Ordering::SeqCst);
 
-        let result = state().lock().unwrap().result.take();
+        let result = lock_state().result.take();
         let _ = DestroyWindow(hwnd);
         let _ = DeleteObject(bmp.into());
         let _ = DeleteDC(mem_dc);
         {
-            let mut st = state().lock().unwrap();
+            let mut st = lock_state();
             st.bits = std::ptr::null_mut();
             st.mem_dc = HDC::default();
             st.bmp = HBITMAP::default();
@@ -318,7 +377,7 @@ pub fn run() -> Option<Selection> {
 }
 
 fn redraw() {
-    let st = state().lock().unwrap();
+    let st = lock_state();
     if st.bits.is_null() || st.width <= 0 || st.height <= 0 {
         return;
     }

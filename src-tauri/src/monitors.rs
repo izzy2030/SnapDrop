@@ -44,6 +44,27 @@ pub fn enumerate() -> Vec<MonitorInfo> {
 
 unsafe extern "system" fn enum_proc(
     hmon: HMONITOR,
+    hdc: HDC,
+    rect: *mut RECT,
+    data: LPARAM,
+) -> windows::core::BOOL {
+    // `extern "system"` callback — a Rust panic here aborts the process ("panic
+    // in a function that cannot unwind"). Contain any panic so enumeration
+    // simply skips the offending monitor instead.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        enum_proc_inner(hmon, hdc, rect, data)
+    }));
+    match result {
+        Ok(b) => b,
+        Err(payload) => {
+            log::error!("monitor enumeration panicked: {}", crate::panic_message(&payload));
+            windows::core::BOOL(1)
+        }
+    }
+}
+
+unsafe fn enum_proc_inner(
+    hmon: HMONITOR,
     _hdc: HDC,
     _rect: *mut RECT,
     data: LPARAM,
@@ -54,7 +75,8 @@ unsafe extern "system" fn enum_proc(
     if GetMonitorInfoW(hmon, &mut mi.monitorInfo).as_bool() {
         let mut dpi_x: u32 = 96;
         let mut dpi_y: u32 = 96;
-        let _ = GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);        monitors.push(MonitorInfo {
+        let _ = GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+        monitors.push(MonitorInfo {
             hmonitor: hmon,
             rect: mi.monitorInfo.rcMonitor,
             work: mi.monitorInfo.rcWork,

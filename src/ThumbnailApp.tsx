@@ -29,6 +29,18 @@ export default function ThumbnailApp() {
   }, []);
 
   useEffect(() => {
+    // Check for pending/latest capture on mount
+    api.getLatestCapture()
+      .then((p) => {
+        if (p && p.preview) {
+          setStack((s) => {
+            if (s.length > 0) return s;
+            return [{ key: nextKey++, path: p.path, preview: p.preview, width: p.width, height: p.height, unsaved: p.unsaved }];
+          });
+        }
+      })
+      .catch(() => {});
+
     const unCaptured = listen<CapturedPayload>("captured", (e) => {
       const p = e.payload;
       setStack((s) =>

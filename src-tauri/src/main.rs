@@ -16,7 +16,14 @@ fn main() {
             "Unknown panic".to_string()
         };
 
-        let msg = format!("SnapDrop panic:\n\nError: {payload}\nLocation: {location}\n\nTimestamp: {:?}", std::time::SystemTime::now());
+        let mut bt = String::new();
+        std::backtrace::Backtrace::force_capture()
+            .to_string()
+            .lines()
+            .take(40)
+            .for_each(|l| bt.push_str(&format!("\n    {l}")));
+
+        let msg = format!("SnapDrop panic:\n\nError: {payload}\nLocation: {location}\nBacktrace:{bt}\n\nTimestamp: {:?}", std::time::SystemTime::now());
         let _ = std::fs::write(std::env::temp_dir().join("snapdrop_panic.txt"), &msg);
 
         #[cfg(windows)]

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { api, HistoryEntry, Settings } from "./api";
 
 type NavTab = "gallery" | "settings" | "about";
@@ -158,24 +159,36 @@ export default function SettingsApp() {
         setHistory(h);
         // Fetch previews for visible entries asynchronously
         h.forEach((entry) => {
-          if (!previews[entry.path]) {
-            api
-              .getCapturePreview(entry.path)
-              .then((preview) => {
-                setPreviews((prev) => ({ ...prev, [entry.path]: preview }));
-              })
-              .catch(() => {});
-          }
+          api
+            .getCapturePreview(entry.path)
+            .then((preview) => {
+              setPreviews((prev) => {
+                if (prev[entry.path] === preview) return prev;
+                return { ...prev, [entry.path]: preview };
+              });
+            })
+            .catch(() => {});
         });
       })
       .catch((e) => console.error("History fetch error:", e));
-  }, [previews]);
+  }, []);
 
   useEffect(() => {
     api.getSettings().then(setSettings).catch((e) => setStatus({ kind: "error", text: String(e) }));
     refreshHistory();
     api.getAppVersion().then(setVersion).catch(() => {});
-  }, []);
+
+    const unCaptured = listen("captured", () => refreshHistory());
+    const unHistory = listen("history-updated", () => refreshHistory());
+    const onFocus = () => refreshHistory();
+    window.addEventListener("focus", onFocus);
+
+    return () => {
+      unCaptured.then((f) => f());
+      unHistory.then((f) => f());
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [refreshHistory]);
 
   const set = (patch: Partial<Settings>) => {
     setSettings((s) => (s ? { ...s, ...patch } : s));
