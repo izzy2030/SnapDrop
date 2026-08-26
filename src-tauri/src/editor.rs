@@ -64,6 +64,11 @@ pub fn show(
     img_h: u32,
     center: (i32, i32),
 ) {
+    crate::debuglog::log(&format!(
+        "editor: show path={:?} full_b64_len={}",
+        path,
+        full_b64.len()
+    ));
     *PENDING.lock().unwrap() = Some(Pending {
         path,
         full_b64: full_b64.clone(),
@@ -73,6 +78,7 @@ pub fn show(
     });
 
     let Some(w) = app.get_webview_window("editor") else {
+        crate::debuglog::log("editor: show -> editor window MISSING");
         return;
     };
 
@@ -149,8 +155,13 @@ fn take_pending(app: &AppHandle) -> Option<Pending> {
 }
 
 fn on_confirmed(app: &AppHandle, payload: ConfirmPayload) {
+    crate::debuglog::log(&format!(
+        "editor: confirmed received (annotated len={})",
+        payload.annotated.len()
+    ));
     log::info!("editor: editor-confirmed received (annotated len={})", payload.annotated.len());
     let Some(pending) = take_pending(app) else {
+        crate::debuglog::log("editor: on_confirmed SKIPPED (no pending or editor not visible)");
         log::warn!("editor: on_confirmed skipped (no pending or editor not visible)");
         return;
     };
@@ -211,8 +222,10 @@ fn on_confirmed(app: &AppHandle, payload: ConfirmPayload) {
 }
 
 fn on_cancelled(app: &AppHandle) {
+    crate::debuglog::log("editor: cancelled received");
     log::info!("editor: editor-cancelled received");
     let Some(pending) = take_pending(app) else {
+        crate::debuglog::log("editor: on_cancelled SKIPPED (no pending or editor not visible)");
         log::warn!("editor: on_cancelled skipped (no pending or editor not visible)");
         return;
     };
@@ -221,6 +234,7 @@ fn on_cancelled(app: &AppHandle) {
 
 /// Close the editor and present the floating thumbnail.
 fn finish(app: &AppHandle, path: Option<String>, _img_w: u32, _img_h: u32, center: (i32, i32)) {
+    crate::debuglog::log(&format!("editor: finish path={:?} -> show_capture_for_at", path));
     log::info!("editor: finish (path={:?})", path);
     hide(app);
     match path {

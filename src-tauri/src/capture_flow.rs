@@ -12,15 +12,19 @@ pub fn run(app: &AppHandle) {
     // contain any panic so it degrades to an error toast instead of killing
     // the process, and restore the windows the flow hides so the app is never
     // left in a broken state.
+    crate::debuglog::log("capture flow: start");
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_inner(app)));
     if let Err(payload) = result {
+        crate::debuglog::log(&format!("capture flow: PANIC {}", crate::panic_message(&payload)));
         log::error!("capture flow panicked: {}", crate::panic_message(&payload));
         if let Some(main_win) = app.get_webview_window("main") {
             let _ = main_win.show();
         }
-        if let Some(thumb) = app.get_webview_window("thumbnail") {
-            let _ = thumb.show();
-        }
+        // Deliberately do NOT show the thumbnail here: it still renders whatever
+        // was on screen before this capture (the flow hides it up front, and if
+        // the panic happened before `show_capture` the renderer has the previous
+        // capture's stack). Re-showing it would display a stale "previous shot"
+        // ghost. The renderer watchdog revives it if a stuck WebView is involved.
         notifier::toast(app, "error", "Capture failed unexpectedly");
     }
 }
@@ -48,6 +52,7 @@ fn run_inner(app: &AppHandle) {
     let sel = match overlay::run(settings.show_editor_after_capture) {
         Some(s) => s,
         None => {
+            crate::debuglog::log("capture flow: overlay cancelled");
             // Cancelled — restore whatever was hidden.
             if was_visible {
                 let _ = thumbnail::set_visible(app, true);
@@ -60,6 +65,13 @@ fn run_inner(app: &AppHandle) {
             return;
         }
     };
+    crate::debuglog::log(&format!(
+        "capture flow: selection rect={:?} ctrl_held={} show_editor_setting={} -> editor={}",
+        sel.rect,
+        sel.ctrl_held,
+        settings.show_editor_after_capture,
+        settings.show_editor_after_capture != sel.ctrl_held
+    ));
 
     // Fresh monitor enumeration handles sleep/wake and monitor changes.
     let monitors = monitors::enumerate();
@@ -102,23 +114,28 @@ fn run_inner(app: &AppHandle) {
         }
     }
 
-    // Clipboard (best-effort; failure must not interrupt the workflow).
-    if settings.copy_to_clipboard {
-        let path_for_clip = saved_path.as_deref().map(std::path::Path::new);
-        if let Err(e) = clipboard::set_image_and_file(
-            &img.bgra,
-            img.width,
-            img.height,
-            path_for_clip.unwrap_or(&std::path::PathBuf::from("SnapDrop.png")),
-        ) {
-            log::warn!("clipboard failed: {e}");
+    // Clipboard and history are best-effort: a failure (or even a panic in the
+    // COM/file code) must never abort the flow before the thumbnail is shown,
+    // otherwise the user gets no thumbnail for a capture that was saved fine.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if settings.copy_to_clipboard {
+            let path_for_clip = saved_path.as_deref().map(std::path::Path::new);
+            if let Err(e) = clipboard::set_image_and_file(
+                &img.bgra,
+                img.width,
+                img.height,
+                path_for_clip.unwrap_or(&std::path::PathBuf::from("SnapDrop.png")),
+            ) {
+                log::warn!("clipboard failed: {e}");
+            }
         }
-    }
-
-    // History (only for saved files).
-    if let Some(p) = &saved_path {
-        history::add(app, p.clone(), Local::now().to_rfc3339());
-    }
+    }));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // History (only for saved files).
+        if let Some(p) = &saved_path {
+            history::add(app, p.clone(), Local::now().to_rfc3339());
+        }
+    }));
 
     let center = (
         (sel.rect.left + monitors::rect_width(&sel.rect) / 2),
@@ -130,6 +147,10 @@ fn run_inner(app: &AppHandle) {
     // thumbnail; with the editor disabled, holding Ctrl opens it for that
     // capture. The screenshot is already saved by this point either way.
     if settings.show_editor_after_capture != sel.ctrl_held {
+        crate::debuglog::log(&format!(
+            "capture flow: saved={:?} -> EDITOR path (unsaved={})",
+            saved_path, unsaved
+        ));
         // Pause with the annotation editor; Enter confirms, Esc cancels. Either
         // way the editor's event handler closes it and shows the thumbnail.
         let full_b64 = match filename::encode_png(&img.bgra, img.width, img.height) {
@@ -144,6 +165,10 @@ fn run_inner(app: &AppHandle) {
         };
         editor::show(app, saved_path, full_b64, img.width, img.height, center);
     } else {
+        crate::debuglog::log(&format!(
+            "capture flow: saved={:?} -> THUMBNAIL path (unsaved={})",
+            saved_path, unsaved
+        ));
         // Preview for the thumbnail.
         let preview_b64 = match filename::preview_png(&img.bgra, img.width, img.height, 512) {
             Some(png) => {

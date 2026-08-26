@@ -51,27 +51,45 @@ export default function ThumbnailApp() {
 
   const addCapture = useCallback((p: CapturedPayload) => {
     const id = p.capture_id;
-    if (!p.preview || !Number.isSafeInteger(id) || id <= 0) return;
-    if (dismissedCaptureIdsRef.current.has(id) || seenCaptureIdsRef.current.has(id)) return;
+    api.debugLog(`addCapture id=${id} preview=${p.preview ? p.preview.length : 0} path=${p.path}`).catch(() => {});
+    if (!p.preview || !Number.isSafeInteger(id) || id <= 0) {
+      api.debugLog(`addCapture REJECT id=${id} (invalid payload)`).catch(() => {});
+      return;
+    }
+    if (dismissedCaptureIdsRef.current.has(id)) {
+      api.debugLog(`addCapture SKIP id=${id} (dismissed)`).catch(() => {});
+      return;
+    }
+    if (seenCaptureIdsRef.current.has(id)) {
+      api.debugLog(`addCapture SKIP id=${id} (already seen)`).catch(() => {});
+      return;
+    }
     seenCaptureIdsRef.current.add(id);
     setStack((s) => [toStackItem(p), ...s].slice(0, 10));
     setExpanded(false);
+    api.debugLog(`addCapture ACCEPT id=${id} -> new stack top`).catch(() => {});
   }, []);
 
   useEffect(() => {
     // Reconcile from the backend as well as listening for events. A renderer
     // can miss a one-shot event while WebView2 is resuming after display sleep.
     const reconcileLatest = () => {
-      void api.getLatestCapture()
+      void api
+        .getLatestCapture()
         .then((p) => {
+          api.debugLog(`reconcile -> id=${p ? p.capture_id : "null"}`).catch(() => {});
           if (p) addCapture(p);
         })
-        .catch(() => {});
+        .catch((e) => {
+          api.debugLog(`reconcile ERROR ${String(e)}`).catch(() => {});
+        });
     };
+    api.debugLog("renderer mounted, starting reconcile").catch(() => {});
     reconcileLatest();
     const reconcileTimer = window.setInterval(reconcileLatest, 1500);
 
     const unCaptured = listen<CapturedPayload>("thumbnail-captured", (e) => {
+      api.debugLog(`event thumbnail-captured id=${e.payload.capture_id}`).catch(() => {});
       addCapture(e.payload);
     });
     const unToast = listen<ToastPayload>("toast", (e) => {
@@ -112,9 +130,11 @@ export default function ThumbnailApp() {
   // folder" and never starts a drag.
   const startNativeDrag = (path: string | null) => {
     if (!path) return;
+    api.debugLog(`drag start path=${path}`).catch(() => {});
     api
       .startDrag(path)
       .then((outcome) => {
+        api.debugLog(`drag done path=${path} dropped=${outcome.dropped} moved=${outcome.moved}`).catch(() => {});
         if (outcome.moved) {
           removeFromStack(path);
         }
@@ -127,6 +147,7 @@ export default function ThumbnailApp() {
         }
       })
       .catch((e) => {
+        api.debugLog(`drag ERROR ${String(e)}`).catch(() => {});
         setToast({ kind: "error", message: `Couldn't start drag: ${e}` });
         if (toastTimer.current) window.clearTimeout(toastTimer.current);
         toastTimer.current = window.setTimeout(() => setToast(null), 4000);
@@ -138,9 +159,15 @@ export default function ThumbnailApp() {
   //   Ctrl+click              → reveal in Explorer (handled on click, after release)
   //   double-click            → open with the default image app
   const onPointerDown = (e: React.PointerEvent, path: string | null) => {
-    if (e.button !== 0 || !path) return;
+    if (e.button !== 0 || !path) {
+      api.debugLog(`pointerdown ignored (button=${e.button} path=${path})`).catch(() => {});
+      return;
+    }
     // Modifier-clicks never start a drag.
-    if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+    if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) {
+      api.debugLog(`pointerdown ignored (modifier ctrl=${e.ctrlKey} meta=${e.metaKey} shift=${e.shiftKey} alt=${e.altKey})`).catch(() => {});
+      return;
+    }
     e.preventDefault();
     const now = Date.now();
     if (now - lastClickRef.current < 350) {

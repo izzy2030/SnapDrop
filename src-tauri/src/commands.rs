@@ -449,6 +449,11 @@ pub fn get_latest_capture() -> Option<thumbnail::CapturedPayload> {
 }
 
 #[tauri::command]
+pub fn debug_log(msg: String) {
+    crate::debuglog::log(&format!("renderer: {msg}"));
+}
+
+#[tauri::command]
 pub fn show_settings(app: AppHandle) -> Result<(), String> {
     show_settings_inner(&app)
 }

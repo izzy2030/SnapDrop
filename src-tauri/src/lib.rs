@@ -1,6 +1,7 @@
 mod capture;
 mod capture_flow;
 mod clipboard;
+mod debuglog;
 mod commands;
 mod dpi;
 mod dragdrop;
@@ -63,6 +64,8 @@ pub fn run() {
         ))
         .setup(|app| {
             use tauri::Manager;
+            debuglog::init(app.handle());
+            debuglog::log("app setup");
             settings::init(app.handle())?;
             history::init(app.handle())?;
             hotkey::init(app.handle());
@@ -70,6 +73,9 @@ pub fn run() {
             editor::init(app.handle());
             let _ = thumbnail::hide_all(app.handle());
             let _ = editor::hide(app.handle());
+            // Watch for a frozen thumbnail renderer (e.g. after display sleep)
+            // and revive it via reload + re-presentation.
+            thumbnail::spawn_renderer_watchdog(app.handle().clone());
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.show();
                 let _ = w.set_focus();
@@ -105,6 +111,7 @@ pub fn run() {
             commands::pick_folder,
             commands::get_capture_preview,
             commands::get_latest_capture,
+            commands::debug_log,
         ])
         .build(tauri::generate_context!())
         .expect("error while building SnapDrop application")

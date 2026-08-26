@@ -190,6 +190,10 @@ unsafe fn overlay_wndproc_inner(
                 })
                 .unwrap_or(false);
             let ctrl_held = is_ctrl_down();
+            crate::debuglog::log(&format!(
+                "overlay: mouse up, selection_ok={} ctrl_held={}",
+                ok, ctrl_held
+            ));
             {
                 let mut st = lock_state();
                 st.done = true;

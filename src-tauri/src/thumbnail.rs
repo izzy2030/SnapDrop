@@ -31,8 +31,29 @@ static THUMBNAIL_WANTED_VISIBLE: AtomicBool = AtomicBool::new(false);
 /// Invalidates delayed presentation retries when a capture starts or the user
 /// explicitly hides the thumbnail.
 static PRESENTATION_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Milliseconds of the last time the thumbnail renderer polled the backend
+/// (`get_latest_capture`). The renderer polls every ~1.5s while alive, so a
+/// stale timestamp means the WebView is frozen or wedged (e.g. after display
+/// sleep) and the thumbnail is a non-interactive ghost.
+static LAST_RENDERER_HEARTBEAT: AtomicU64 = AtomicU64::new(0);
+/// Milliseconds of the last presentation attempt (successful or retried).
+static LAST_PRESENT_AT: AtomicU64 = AtomicU64::new(0);
+/// Milliseconds of the last forced renderer recovery. Throttles the watchdog
+/// so a wedged WebView cannot trigger a reload loop.
+static LAST_RECOVERY_AT: AtomicU64 = AtomicU64::new(0);
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 pub fn get_latest_capture() -> Option<CapturedPayload> {
+    // Doubles as the renderer heartbeat: the thumbnail page calls this on a
+    // 1.5s poll, so a live page keeps this fresh and the watchdog knows a
+    // stale value means the WebView is stuck.
+    LAST_RENDERER_HEARTBEAT.store(now_millis(), Ordering::SeqCst);
     LATEST_CAPTURE.lock().unwrap().clone()
 }
 
@@ -95,6 +116,15 @@ pub fn show_capture(
         height: img_h,
         unsaved,
     };
+    crate::debuglog::log(&format!(
+        "thumbnail: show_capture id={} path={:?} unsaved={} show_thumbnail_setting={} center=({},{})",
+        payload.capture_id,
+        payload.path,
+        payload.unsaved,
+        settings.show_thumbnail,
+        sel_center.0,
+        sel_center.1
+    ));
     *LATEST_CAPTURE.lock().unwrap() = Some(payload.clone());
     *LAST_CAPTURE_CENTER.lock().unwrap() = Some(sel_center);
     THUMBNAIL_WANTED_VISIBLE.store(true, Ordering::SeqCst);
@@ -118,6 +148,7 @@ fn present_capture(
     if PRESENTATION_GENERATION.load(Ordering::SeqCst) != generation {
         return;
     }
+    LAST_PRESENT_AT.store(now_millis(), Ordering::SeqCst);
     let settings = settings::get(app);
     if !settings.show_thumbnail {
         return;
@@ -126,33 +157,41 @@ fn present_capture(
     let (size, position) = thumbnail_geometry(&settings, img_w, img_h, sel_center);
     let mut should_retry = false;
 
+    let mut op_results = Vec::new();
     if let Some(w) = app.get_webview_window("thumbnail") {
         if let Err(e) = w.set_size(Size::Physical(size)) {
             log::warn!("thumbnail: set size failed (attempt {attempt}): {e}");
+            op_results.push("size:err".to_string());
             should_retry = true;
         }
         if let Some(position) = position {
             if let Err(e) = w.set_position(position) {
                 log::warn!("thumbnail: set position failed (attempt {attempt}): {e}");
+                op_results.push("pos:err".to_string());
                 should_retry = true;
             }
         }
         if let Err(e) = w.show() {
             log::warn!("thumbnail: show failed (attempt {attempt}): {e}");
+            op_results.push("show:err".to_string());
             should_retry = true;
         }
         if !w.is_visible().unwrap_or(false) {
             log::warn!("thumbnail: window still hidden after show (attempt {attempt})");
+            op_results.push("visible:false".to_string());
             should_retry = true;
         }
         if let Err(e) = w.unminimize() {
             log::warn!("thumbnail: unminimize failed (attempt {attempt}): {e}");
+            op_results.push("unmin:err".to_string());
             should_retry = true;
         }
         if let Err(e) = w.set_always_on_top(true) {
             log::warn!("thumbnail: always-on-top failed (attempt {attempt}): {e}");
+            op_results.push("aot:err".to_string());
             should_retry = true;
         }
+        op_results.push("ok".to_string());
         log::info!(
             "thumbnail::show_capture pos={:?} size={}x{} path={:?} attempt={attempt}",
             position,
@@ -162,16 +201,27 @@ fn present_capture(
         );
     } else {
         log::error!("thumbnail::show_capture: thumbnail window not found (attempt {attempt})");
+        op_results.push("window:missing".to_string());
         should_retry = true;
     }
 
     // Keep the event for the Settings window's history refresh and for the
     // thumbnail renderer. The renderer also reconciles from LATEST_CAPTURE,
     // so a wake-time event delivery gap is harmless.
-    if let Err(e) = app.emit("thumbnail-captured", payload.clone()) {
+    let emit_result = app.emit("thumbnail-captured", payload.clone());
+    let emit_ok = emit_result.is_ok();
+    if let Err(e) = emit_result {
         log::warn!("thumbnail: captured event failed (attempt {attempt}): {e}");
         should_retry = true;
     }
+    crate::debuglog::log(&format!(
+        "thumbnail: present id={} attempt={} ops={} emit={} retry={}",
+        payload.capture_id,
+        attempt,
+        op_results.join(","),
+        if emit_ok { "ok" } else { "err" },
+        should_retry
+    ));
 
     if should_retry && attempt < MAX_PRESENT_RETRIES {
         schedule_present_retry(
@@ -280,14 +330,45 @@ fn schedule_present_retry(
     });
 }
 
-/// Rebuild the thumbnail WebView's state after the application/display resumes.
-/// The native window may still exist but its renderer can have missed events or
-/// retained stale visibility/position state across a long sleep.
-pub fn recover_after_resume(app: &AppHandle) {
+/// Recover the thumbnail when the renderer has gone quiet: reload its WebView
+/// and re-present the latest capture. Only acts when the renderer's heartbeat
+/// (the 1.5s `get_latest_capture` poll) has stopped, so a healthy thumbnail is
+/// never touched, and is throttled so a wedged WebView can't cause a reload
+/// loop.
+const RENDERER_STALE_AFTER_MS: u64 = 10_000;
+const RECOVERY_COOLDOWN_MS: u64 = 60_000;
+
+/// Decide whether the thumbnail renderer needs a forced recovery. Pure so the
+/// watchdog and resume hook share one throttled policy and it is testable:
+/// the renderer heartbeat (`get_latest_capture` poll) stopped, we didn't just
+/// present, and we haven't recovered in the cooldown window.
+fn should_recover(now: u64, heartbeat: u64, last_present: u64, last_recovery: u64) -> bool {
+    if now.saturating_sub(heartbeat) < RENDERER_STALE_AFTER_MS {
+        return false; // renderer is alive and polling
+    }
+    if now.saturating_sub(last_present) < RENDERER_STALE_AFTER_MS {
+        return false; // just presented (capture flow mid-presentation)
+    }
+    if now.saturating_sub(last_recovery) < RECOVERY_COOLDOWN_MS {
+        return false; // at most one forced recovery per minute
+    }
+    true
+}
+
+pub fn recover_if_stale(app: &AppHandle) {
     if !THUMBNAIL_WANTED_VISIBLE.load(Ordering::SeqCst) {
         return;
     }
-    let Some(payload) = get_latest_capture() else {
+    let now = now_millis();
+    let heartbeat = LAST_RENDERER_HEARTBEAT.load(Ordering::SeqCst);
+    let last_present = LAST_PRESENT_AT.load(Ordering::SeqCst);
+    let last_recovery = LAST_RECOVERY_AT.load(Ordering::SeqCst);
+    if !should_recover(now, heartbeat, last_present, last_recovery) {
+        return;
+    }
+    // Read the payload directly (not via `get_latest_capture`) so this recovery
+    // does not bump the renderer heartbeat and mask a still-dead WebView.
+    let Some(payload) = LATEST_CAPTURE.lock().unwrap().clone() else {
         return;
     };
     let center = LAST_CAPTURE_CENTER.lock().unwrap().unwrap_or((0, 0));
@@ -296,9 +377,16 @@ pub fn recover_after_resume(app: &AppHandle) {
         return;
     }
 
+    LAST_RECOVERY_AT.store(now, Ordering::SeqCst);
+    crate::debuglog::log(&format!(
+        "thumbnail: RECOVER stale heartbeat ({}s) -> reload + present id={}",
+        (now - heartbeat) / 1000,
+        payload.capture_id
+    ));
+    log::warn!("thumbnail: renderer heartbeat stale ({}s); reloading and re-presenting", (now - heartbeat) / 1000);
     if let Some(w) = app.get_webview_window("thumbnail") {
         if let Err(e) = w.reload() {
-            log::warn!("thumbnail: reload after resume failed: {e}");
+            log::warn!("thumbnail: reload after stale heartbeat failed: {e}");
         }
     }
     present_capture(
@@ -310,6 +398,37 @@ pub fn recover_after_resume(app: &AppHandle) {
         generation,
         0,
     );
+}
+
+/// Rebuild the thumbnail WebView's state after the application/display resumes.
+/// Re-presentation without a reload is harmless (the renderer dedupes by
+/// capture id and reconciles from `LATEST_CAPTURE`); a genuinely frozen
+/// renderer is handled by the heartbeat watchdog instead.
+pub fn recover_after_resume(app: &AppHandle) {
+    recover_if_stale(app);
+}
+
+/// Background watchdog: while the thumbnail is meant to be visible, check that
+/// the renderer is still polling. A WebView that froze across display sleep
+/// stops answering IPC and would otherwise remain a stale, non-draggable ghost
+/// until the app restarts. Runs every few seconds on a dedicated thread.
+pub fn spawn_renderer_watchdog(app: AppHandle) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        // Don't wake the event loop unless the thumbnail is meant to be
+        // visible; when hidden (dismissed, auto-hide, or between captures)
+        // there is nothing to recover.
+        if !THUMBNAIL_WANTED_VISIBLE.load(Ordering::SeqCst) {
+            continue;
+        }
+        let app_for_main = app.clone();
+        let sent = app.run_on_main_thread(move || {
+            recover_if_stale(&app_for_main);
+        });
+        if sent.is_err() {
+            return; // event loop gone (app shutting down)
+        }
+    });
 }
 
 /// Show the thumbnail for an existing file (tray "Recent Captures").
@@ -366,6 +485,21 @@ pub fn show_capture_for_at(app: &AppHandle, path: &str, sel_center: Option<(i32,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_fires_only_when_renderer_is_stale_and_throttled() {
+        let now = 1_000_000u64;
+        // Live renderer: heartbeat fresh → never recover.
+        assert!(!should_recover(now, now - 1_000, now - 60_000, 0));
+        // Stale renderer, but we just presented → wait.
+        assert!(!should_recover(now, 0, now - 1_000, 0));
+        // Stale renderer, no recent present, but recovered 30s ago → cooldown.
+        assert!(!should_recover(now, 0, now - 60_000, now - 30_000));
+        // Stale renderer, nothing recent → recover.
+        assert!(should_recover(now, 0, now - 60_000, now - 120_000));
+        // Recovery just happened → must wait out the cooldown again.
+        assert!(!should_recover(now, 0, now - 60_000, now - 1_000));
+    }
 
     #[test]
     fn capture_payload_serializes_identity_for_reconciliation() {
