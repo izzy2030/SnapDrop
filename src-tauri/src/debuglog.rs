@@ -47,6 +47,26 @@ pub fn init(app: &tauri::AppHandle) {
     log(&format!("===== session start ({}) =====", wall_clock()));
 }
 
+fn log_path(app: &tauri::AppHandle) -> PathBuf {
+    app.path()
+        .app_config_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("snapdrop-debug.log")
+}
+
+pub fn read(app: &tauri::AppHandle) -> Result<String, String> {
+    let path = log_path(app);
+    std::fs::read_to_string(&path).map_err(|e| format!("Could not read {}: {e}", path.display()))
+}
+
+pub fn open(app: &tauri::AppHandle) -> Result<(), String> {
+    let path = log_path(app);
+    if !path.exists() {
+        let _ = OpenOptions::new().create(true).append(true).open(&path);
+    }
+    crate::commands::open_with_default_app(&path.to_string_lossy())
+}
+
 /// Append a timestamped line to the debug log (no-op before `init`).
 pub fn log(msg: &str) {
     let secs = elapsed_secs();

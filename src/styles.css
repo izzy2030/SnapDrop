@@ -170,11 +170,10 @@ input[type="checkbox"] {
 }
 
 .about-logo-img {
-  width: 100%;
-  max-width: 240px;
-  height: auto;
-  max-height: 60px;
-  object-fit: contain;
+  width: 72px;
+  height: 72px;
+  object-fit: cover;
+  background: #000000;
   filter: drop-shadow(0 4px 12px rgba(0, 0, 0, 0.5));
 }
 
@@ -914,10 +913,11 @@ input[type="checkbox"] {
 }
 
 .about-logo-large {
-  width: 56px;
-  height: 56px;
-  background: linear-gradient(135deg, #ff8c00, #ff5100);
-  border-radius: 14px;
+  width: 72px;
+  height: 72px;
+  background: #000000;
+  border-radius: 18px;
+  overflow: hidden;
   display: flex;
   align-items: center;
   justify-content: center;

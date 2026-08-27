@@ -67,4 +67,6 @@ export const api = {
     invoke<string>("get_capture_preview", { path }),
   getLatestCapture: () => invoke<CapturedPayload | null>("get_latest_capture"),
   debugLog: (msg: string) => invoke<void>("debug_log", { msg }),
+  getDebugLog: () => invoke<string>("get_debug_log"),
+  openDebugLog: () => invoke<void>("open_debug_log"),
 };

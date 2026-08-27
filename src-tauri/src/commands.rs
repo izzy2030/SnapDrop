@@ -454,6 +454,16 @@ pub fn debug_log(msg: String) {
 }
 
 #[tauri::command]
+pub fn get_debug_log(app: AppHandle) -> Result<String, String> {
+    crate::debuglog::read(&app)
+}
+
+#[tauri::command]
+pub fn open_debug_log(app: AppHandle) -> Result<(), String> {
+    crate::debuglog::open(&app)
+}
+
+#[tauri::command]
 pub fn show_settings(app: AppHandle) -> Result<(), String> {
     show_settings_inner(&app)
 }

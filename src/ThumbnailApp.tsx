@@ -38,6 +38,7 @@ export default function ThumbnailApp() {
   const lastClickRef = useRef(0);
   const seenCaptureIdsRef = useRef(new Set<number>());
   const dismissedCaptureIdsRef = useRef(new Set<number>());
+  const reconcileInFlightRef = useRef(false);
 
   const removeFromStack = useCallback((path: string) => {
     setStack((s) => {
@@ -74,17 +75,28 @@ export default function ThumbnailApp() {
     // Reconcile from the backend as well as listening for events. A renderer
     // can miss a one-shot event while WebView2 is resuming after display sleep.
     const reconcileLatest = () => {
+      const startedAt = performance.now();
+      api.debugLog(`reconcile begin pending=${reconcileInFlightRef.current}`).catch(() => {});
+      // IPC can remain pending while WebView2 is recovering. Do not build an
+      // unbounded queue of calls every 1.5s; one probe at a time also keeps the
+      // renderer responsive after a delayed IPC reply.
+      if (reconcileInFlightRef.current) return;
+      reconcileInFlightRef.current = true;
       void api
         .getLatestCapture()
         .then((p) => {
-          api.debugLog(`reconcile -> id=${p ? p.capture_id : "null"}`).catch(() => {});
+          api.debugLog(`reconcile success elapsed_ms=${Math.round(performance.now() - startedAt)} id=${p ? p.capture_id : "null"} preview_len=${p?.preview?.length ?? 0}`).catch(() => {});
           if (p) addCapture(p);
         })
         .catch((e) => {
-          api.debugLog(`reconcile ERROR ${String(e)}`).catch(() => {});
+          api.debugLog(`reconcile ERROR elapsed_ms=${Math.round(performance.now() - startedAt)} ${String(e)}`).catch(() => {});
+        })
+        .finally(() => {
+          reconcileInFlightRef.current = false;
+          api.debugLog(`reconcile end elapsed_ms=${Math.round(performance.now() - startedAt)}`).catch(() => {});
         });
     };
-    api.debugLog("renderer mounted, starting reconcile").catch(() => {});
+    api.debugLog(`renderer mounted href=${window.location.href} visibility=${document.visibilityState} dpr=${window.devicePixelRatio}`).catch(() => {});
     reconcileLatest();
     const reconcileTimer = window.setInterval(reconcileLatest, 1500);
 
@@ -194,6 +206,22 @@ export default function ThumbnailApp() {
       if (stack.length > 1 && !expanded) setExpanded(true);
     }
   };
+
+  useEffect(() => {
+    const reportVisibility = () => {
+      api.debugLog(`renderer visibility=${document.visibilityState} hidden=${document.hidden} stack=${stack.length} current_id=${stack[0]?.captureId ?? 0}`).catch(() => {});
+    };
+    document.addEventListener("visibilitychange", reportVisibility);
+    window.addEventListener("pageshow", reportVisibility);
+    window.addEventListener("pagehide", reportVisibility);
+    window.addEventListener("error", (e) => api.debugLog(`renderer window.error message=${e.message} source=${e.filename}:${e.lineno}:${e.colno}`).catch(() => {}));
+    window.addEventListener("unhandledrejection", (e) => api.debugLog(`renderer unhandledrejection reason=${String(e.reason)}`).catch(() => {}));
+    return () => {
+      document.removeEventListener("visibilitychange", reportVisibility);
+      window.removeEventListener("pageshow", reportVisibility);
+      window.removeEventListener("pagehide", reportVisibility);
+    };
+  }, [stack]);
 
   return (
     <div className="thumbnail-root">

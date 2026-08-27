@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Size};
 
 use crate::{monitors, settings};
@@ -41,6 +41,9 @@ static LAST_PRESENT_AT: AtomicU64 = AtomicU64::new(0);
 /// Milliseconds of the last forced renderer recovery. Throttles the watchdog
 /// so a wedged WebView cannot trigger a reload loop.
 static LAST_RECOVERY_AT: AtomicU64 = AtomicU64::new(0);
+/// Serializes WebView recovery so overlapping watchdog/resume callbacks cannot
+/// reload and present the same window concurrently.
+static RECOVERY_IN_PROGRESS: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
@@ -53,13 +56,22 @@ pub fn get_latest_capture() -> Option<CapturedPayload> {
     // Doubles as the renderer heartbeat: the thumbnail page calls this on a
     // 1.5s poll, so a live page keeps this fresh and the watchdog knows a
     // stale value means the WebView is stuck.
-    LAST_RENDERER_HEARTBEAT.store(now_millis(), Ordering::SeqCst);
-    LATEST_CAPTURE.lock().unwrap().clone()
+    let now = now_millis();
+    LAST_RENDERER_HEARTBEAT.store(now, Ordering::SeqCst);
+    let payload = LATEST_CAPTURE.lock().unwrap().clone();
+    crate::debuglog::log(&format!(
+        "thumbnail: IPC get_latest_capture heartbeat={} payload_id={} preview_len={}",
+        now,
+        payload.as_ref().map(|p| p.capture_id).unwrap_or(0),
+        payload.as_ref().map(|p| p.preview.len()).unwrap_or(0)
+    ));
+    payload
 }
 
 pub fn hide_all(app: &AppHandle) -> Result<(), String> {
     THUMBNAIL_WANTED_VISIBLE.store(false, Ordering::SeqCst);
-    PRESENTATION_GENERATION.fetch_add(1, Ordering::SeqCst);
+    let generation = PRESENTATION_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    crate::debuglog::log(&format!("thumbnail: hide requested generation={generation}"));
     if let Some(w) = app.get_webview_window("thumbnail") {
         w.hide().map_err(|e| {
             log::warn!("thumbnail: hide failed: {e}");
@@ -77,6 +89,7 @@ pub fn is_visible(app: &AppHandle) -> bool {
 
 pub fn set_visible(app: &AppHandle, visible: bool) -> Result<(), String> {
     THUMBNAIL_WANTED_VISIBLE.store(visible, Ordering::SeqCst);
+    crate::debuglog::log(&format!("thumbnail: set_visible requested visible={visible}"));
     if let Some(w) = app.get_webview_window("thumbnail") {
         let result = if visible { w.show() } else { w.hide() };
         result.map_err(|e| {
@@ -148,7 +161,8 @@ fn present_capture(
     if PRESENTATION_GENERATION.load(Ordering::SeqCst) != generation {
         return;
     }
-    LAST_PRESENT_AT.store(now_millis(), Ordering::SeqCst);
+    let present_started = now_millis();
+    LAST_PRESENT_AT.store(present_started, Ordering::SeqCst);
     let settings = settings::get(app);
     if !settings.show_thumbnail {
         return;
@@ -159,6 +173,15 @@ fn present_capture(
 
     let mut op_results = Vec::new();
     if let Some(w) = app.get_webview_window("thumbnail") {
+        crate::debuglog::log(&format!(
+            "thumbnail: native state before present id={} attempt={} visible={:?} size={}x{} position={:?}",
+            payload.capture_id,
+            attempt,
+            w.is_visible().ok(),
+            size.width,
+            size.height,
+            position
+        ));
         if let Err(e) = w.set_size(Size::Physical(size)) {
             log::warn!("thumbnail: set size failed (attempt {attempt}): {e}");
             op_results.push("size:err".to_string());
@@ -215,12 +238,14 @@ fn present_capture(
         should_retry = true;
     }
     crate::debuglog::log(&format!(
-        "thumbnail: present id={} attempt={} ops={} emit={} retry={}",
+        "thumbnail: present id={} attempt={} ops={} emit={} retry={} elapsed_ms={} native_visible={:?}",
         payload.capture_id,
         attempt,
         op_results.join(","),
         if emit_ok { "ok" } else { "err" },
-        should_retry
+        should_retry,
+        now_millis().saturating_sub(present_started),
+        app.get_webview_window("thumbnail").and_then(|w| w.is_visible().ok())
     ));
 
     if should_retry && attempt < MAX_PRESENT_RETRIES {
@@ -359,6 +384,13 @@ pub fn recover_if_stale(app: &AppHandle) {
     if !THUMBNAIL_WANTED_VISIBLE.load(Ordering::SeqCst) {
         return;
     }
+    let recovery_lock = RECOVERY_IN_PROGRESS.get_or_init(|| Mutex::new(()));
+    let _recovery_guard = recovery_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Re-check after waiting: another watchdog tick may have recovered it.
+    if !THUMBNAIL_WANTED_VISIBLE.load(Ordering::SeqCst) {
+        return;
+    }
     let now = now_millis();
     let heartbeat = LAST_RENDERER_HEARTBEAT.load(Ordering::SeqCst);
     let last_present = LAST_PRESENT_AT.load(Ordering::SeqCst);
@@ -374,6 +406,11 @@ pub fn recover_if_stale(app: &AppHandle) {
     let center = LAST_CAPTURE_CENTER.lock().unwrap().unwrap_or((0, 0));
     let generation = PRESENTATION_GENERATION.load(Ordering::SeqCst);
     if generation == 0 {
+        return;
+    }
+    // A hide/capture can invalidate this recovery while we were waiting for
+    // the lock; never resurrect a thumbnail the user dismissed.
+    if !THUMBNAIL_WANTED_VISIBLE.load(Ordering::SeqCst) {
         return;
     }
 

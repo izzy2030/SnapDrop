@@ -136,6 +136,7 @@ export default function SettingsApp() {
   const [status, setStatus] = useState<Status>(null);
   const [version, setVersion] = useState<string>("");
   const [showMoreMenu, setShowMoreMenu] = useState(false);
+  const [debugLog, setDebugLog] = useState<string | null>(null);
   const moreMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -769,6 +770,9 @@ export default function SettingsApp() {
                 <span style={{ fontWeight: 600, fontSize: 14 }}>Preferences</span>
               </div>
               <div className="topbar-right">
+                <button type="button" onClick={() => api.openDebugLog()}>
+                  Open diagnostic log
+                </button>
                 <button
                   type="button"
                   className="primary"
@@ -787,6 +791,18 @@ export default function SettingsApp() {
                     {status.text}
                   </div>
                 )}
+
+                <section className="settings-section">
+                  <h2>Diagnostics</h2>
+                  <p className="field-hint">Use this after the floating thumbnail stops responding. The log records renderer heartbeats, native window state, recovery attempts, and JavaScript errors.</p>
+                  <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                    <button type="button" onClick={async () => setDebugLog(await api.getDebugLog())}>View diagnostic log</button>
+                    <button type="button" onClick={() => api.openDebugLog()}>Open log in Notepad</button>
+                  </div>
+                  {debugLog !== null && (
+                    <textarea readOnly value={debugLog} style={{ width: "100%", minHeight: 220, marginTop: 10, fontFamily: "monospace", fontSize: 11 }} />
+                  )}
+                </section>
 
                 <section className="settings-section">
                   <h2>Capture</h2>
@@ -942,7 +958,7 @@ export default function SettingsApp() {
             <div className="canvas-body">
               <div className="about-card">
                 <div className="about-logo-large">
-                  <img src="/assets/logo-full.png" alt="SnapDrop" className="about-logo-img" />
+                  <img src="/assets/SnapDrop_Square.png" alt="SnapDrop" className="about-logo-img" />
                 </div>
                 <h2>SnapDrop</h2>
                 <p>Version {version || "1.0.0"} • Ultra-fast Windows screen capture & real-time drag-and-drop utility.</p>

@@ -78,7 +78,11 @@ pub fn run() {
             thumbnail::spawn_renderer_watchdog(app.handle().clone());
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.show();
+                let _ = w.unminimize();
                 let _ = w.set_focus();
+                debuglog::log("main window shown during setup");
+            } else {
+                debuglog::log("ERROR: main window was not found during setup");
             }
             Ok(())
         })
@@ -112,6 +116,8 @@ pub fn run() {
             commands::get_capture_preview,
             commands::get_latest_capture,
             commands::debug_log,
+            commands::get_debug_log,
+            commands::open_debug_log,
         ])
         .build(tauri::generate_context!())
         .expect("error while building SnapDrop application")
