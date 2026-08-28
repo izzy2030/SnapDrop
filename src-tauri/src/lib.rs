@@ -18,7 +18,7 @@ mod thumbnail;
 mod tray;
 
 use std::sync::atomic::AtomicBool;
-use tauri::RunEvent;
+use tauri::{Manager, RunEvent};
 
 /// Global pause state for the capture hotkey (toggled from the tray).
 pub static PAUSED: AtomicBool = AtomicBool::new(false);
@@ -74,6 +74,16 @@ pub fn run() {
             editor::init(app.handle());
             let _ = thumbnail::hide_all(app.handle());
             let _ = editor::hide(app.handle());
+            // The native thumbnail replaced the WebView2 renderer. Left alive,
+            // the config-defined "thumbnail" window would still mount its page
+            // and poll `get_latest_capture` every 1.5s forever — a 250KB+ IPC
+            // payload plus debug-log writes on the main thread, every tick, for
+            // nothing. All webview code paths guard on the window being gone.
+            if thumbnail::NATIVE_THUMBNAIL {
+                if let Some(w) = app.get_webview_window("thumbnail") {
+                    let _ = w.close();
+                }
+            }
             // Watch for a frozen thumbnail renderer (e.g. after display sleep)
             // and revive it via reload + re-presentation.
             thumbnail::spawn_renderer_watchdog(app.handle().clone());
@@ -90,9 +100,27 @@ pub fn run() {
         .on_window_event(|window, event| {
             if window.label() == "main" {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    // Close-to-tray: hide instead of quitting.
-                    api.prevent_close();
-                    let _ = window.hide();
+                    // Close-to-tray: hide instead of quitting (unless the
+                    // user disabled it in Settings, in which case close exits).
+                    if settings::get(window.app_handle()).close_to_tray {
+                        api.prevent_close();
+                        // Defer the hide off the CloseRequested stack frame.
+                        // Calling window.hide() synchronously right after
+                        // prevent_close() is racy and frequently gets undone
+                        // (the window stays visible), which reads as "the
+                        // close button does nothing". Schedule it a moment
+                        // later so it reliably takes effect.
+                        let app = window.app_handle().clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_millis(30));
+                            let app2 = app.clone();
+                            let _ = app.run_on_main_thread(move || {
+                                if let Some(w) = app2.get_webview_window("main") {
+                                    let _ = w.hide();
+                                }
+                            });
+                        });
+                    }
                 }
             }
         })

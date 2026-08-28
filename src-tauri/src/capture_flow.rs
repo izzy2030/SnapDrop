@@ -1,11 +1,52 @@
+use std::ffi::c_void;
 use std::fs;
 use chrono::Local;
 use tauri::{AppHandle, Manager};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::WindowsAndMessaging::{
+    IsIconic, ShowWindow, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE,
+};
+
+/// Rebuild the app's windows-0.62 HWND from tauri's HWND (tauri links a
+/// different `windows` crate version; both wrap the same raw pointer).
+fn to_hwnd(raw: *mut c_void) -> HWND {
+    HWND(raw)
+}
 
 use crate::{
     capture, clipboard, editor, filename, history, monitors, notifier, overlay, settings,
     thumbnail, tray,
 };
+
+/// Show the main window again in its previous state WITHOUT activating it, so
+/// SnapDrop never steals focus from the app the user was working in — it just
+/// stays on the taskbar.
+fn restore_main_window(app: &AppHandle, was_visible: bool, was_minimized: bool) {
+    if !was_visible {
+        return;
+    }
+    let Some(main_win) = app.get_webview_window("main") else {
+        return;
+    };
+    match main_win.hwnd() {
+        Ok(tauri_hwnd) => {
+            let hwnd = to_hwnd(tauri_hwnd.0);
+            let _ = unsafe {
+                ShowWindow(
+                    hwnd,
+                    if was_minimized {
+                        SW_SHOWMINNOACTIVE
+                    } else {
+                        SW_SHOWNOACTIVATE
+                    },
+                )
+            };
+        }
+        Err(_) => {
+            let _ = main_win.show();
+        }
+    }
+}
 
 pub fn run(app: &AppHandle) {
     // The capture flow may run inside a message dispatch on the main thread;
@@ -31,11 +72,17 @@ pub fn run(app: &AppHandle) {
 
 fn run_inner(app: &AppHandle) {
     // Hide main window and floating thumbnails so they never appear in the capture.
-    let main_was_visible = app
-        .get_webview_window("main")
+    let main_win = app.get_webview_window("main");
+    let main_was_visible = main_win
+        .as_ref()
         .and_then(|w| w.is_visible().ok())
         .unwrap_or(false);
-    if let Some(main_win) = app.get_webview_window("main") {
+    let main_was_minimized = main_win
+        .as_ref()
+        .and_then(|w| w.hwnd().ok())
+        .map(|h| unsafe { IsIconic(to_hwnd(h.0)).as_bool() })
+        .unwrap_or(false);
+    if let Some(main_win) = &main_win {
         let _ = main_win.hide();
     }
 
@@ -57,11 +104,7 @@ fn run_inner(app: &AppHandle) {
             if was_visible {
                 let _ = thumbnail::set_visible(app, true);
             }
-            if main_was_visible {
-                if let Some(main_win) = app.get_webview_window("main") {
-                    let _ = main_win.show();
-                }
-            }
+            restore_main_window(app, main_was_visible, main_was_minimized);
             return;
         }
     };
@@ -180,4 +223,9 @@ fn run_inner(app: &AppHandle) {
         thumbnail::show_capture(app, saved_path, preview_b64, img.width, img.height, unsaved, center);
     }
     tray::refresh(app);
+
+    // The flow hid the main window so it never appears in the screenshot;
+    // bring it back (without stealing focus) so the app only goes to the tray
+    // when the user closes it.
+    restore_main_window(app, main_was_visible, main_was_minimized);
 }

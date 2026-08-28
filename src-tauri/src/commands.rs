@@ -1,12 +1,47 @@
 //! Tauri IPC commands.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 use tauri::{AppHandle, Manager};
 use windows::Win32::Foundation::HWND;
 
 use crate::{clipboard, dragdrop, filename, history, hotkey, settings, thumbnail};
+
+/// Decoded-preview cache, keyed by capture path. Capture files are immutable
+/// once written, so a path's preview never changes — decode each screenshot
+/// at most once per process. (Without this, every history refresh re-read and
+/// re-decoded every full-size screenshot, and those decodes ran synchronously
+/// on the main/UI thread — stalling window drags, clicks, and deletions.)
+fn preview_cache() -> &'static Mutex<HashMap<String, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn build_capture_preview(path: &str) -> Result<String, String> {
+    use base64::Engine;
+    if let Ok(reader) = image::ImageReader::open(path).and_then(|r| r.with_guessed_format()) {
+        if let Ok(img) = reader.decode() {
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            let mut bgra = Vec::with_capacity((w as usize) * (h as usize) * 4);
+            for px in rgba.pixels() {
+                bgra.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            }
+            if let Some(png) = filename::preview_png(&bgra, w, h, 256) {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+                return Ok(format!("data:image/png;base64,{b64}"));
+            }
+        }
+    }
+    // Fallback: the whole file, base64-wrapped. (Read happens only here —
+    // the decode path above never needs the raw bytes.)
+    let bytes = fs::read(path).map_err(|e| e.to_string())?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:image/png;base64,{b64}"))
+}
 
 #[tauri::command]
 pub fn get_settings(app: AppHandle) -> settings::Settings {
@@ -402,25 +437,28 @@ pub fn capture_now(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn get_capture_preview(_app: AppHandle, path: String) -> Result<String, String> {
-    use base64::Engine;
-    let bytes = fs::read(&path).map_err(|e| e.to_string())?;
-    if let Ok(reader) = image::ImageReader::open(&path).and_then(|r| r.with_guessed_format()) {
-        if let Ok(img) = reader.decode() {
-            let rgba = img.to_rgba8();
-            let (w, h) = rgba.dimensions();
-            let mut bgra = Vec::with_capacity((w as usize) * (h as usize) * 4);
-            for px in rgba.pixels() {
-                bgra.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
-            }
-            if let Some(png) = filename::preview_png(&bgra, w, h, 256) {
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
-                return Ok(format!("data:image/png;base64,{b64}"));
-            }
-        }
+pub async fn get_capture_preview(_app: AppHandle, path: String) -> Result<String, String> {
+    // Cache hit → instant, no decode. Cache misses are decoded via
+    // spawn_blocking: `async` + blocking pool keeps the heavy PNG decode OFF
+    // the main/UI thread. A synchronous decode of a full-size screenshot
+    // takes tens to hundreds of ms, and the gallery fetches one per entry on
+    // every window focus — blocking the main thread exactly when the user
+    // presses the title bar, which made window drags feel "stuck then pulling".
+    if let Some(hit) = preview_cache().lock().unwrap().get(&path) {
+        return Ok(hit.clone());
     }
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Ok(format!("data:image/png;base64,{b64}"))
+    let decode_path = path.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || build_capture_preview(&decode_path))
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Ok(url) = &result {
+        let mut cache = preview_cache().lock().unwrap();
+        if cache.len() > 64 {
+            cache.clear(); // captures are capped by max_history anyway
+        }
+        cache.insert(path, url.clone());
+    }
+    result
 }
 
 #[tauri::command]
@@ -529,6 +567,50 @@ pub fn reveal_in_explorer(path: &str) -> Result<(), String> {
     let p = std::path::Path::new(path);
     let folder = p.parent().unwrap_or(p);
     show_folder_in_explorer(&folder.to_string_lossy(), Some(path))
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    /// Quantifies why the preview decode must stay off the main thread:
+    /// one gallery refresh used to run this once per entry, synchronously on
+    /// the UI thread. Run with `cargo test -- --nocapture` to see the timing.
+    #[test]
+    fn preview_decode_cost_and_cache() {
+        // Synthesize a 2560x1440 screenshot-sized PNG.
+        let dir = std::env::temp_dir().join("snapdrop_preview_test");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("cost_test.png");
+        let w = 2560u32;
+        let h = 1440u32;
+        let mut bgra = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                bgra.extend_from_slice(&[(x % 255) as u8, (y % 255) as u8, 128, 255]);
+            }
+        }
+        let png = filename::encode_png(&bgra, w, h).unwrap();
+        fs::write(&path, &png).unwrap();
+
+        let path_str = path.to_string_lossy().to_string();
+        let start = std::time::Instant::now();
+        let first = build_capture_preview(&path_str).unwrap();
+        let cold_ms = start.elapsed().as_millis();
+
+        // Prime the cache, then measure a hit.
+        preview_cache().lock().unwrap().insert(path_str.clone(), first.clone());
+        let start = std::time::Instant::now();
+        let cached = preview_cache().lock().unwrap().get(&path_str).unwrap().clone();
+        let warm_us = start.elapsed().as_micros();
+
+        assert_eq!(first, cached, "cache hit must return the same preview");
+        println!(
+            "preview decode of a {w}x{h} screenshot: {cold_ms}ms cold, {warm_us}us cached — a 10-entry refresh used to cost ~{}ms ON THE MAIN THREAD",
+            cold_ms * 10
+        );
+        let _ = fs::remove_file(&path);
+    }
 }
 
 #[cfg(test)]

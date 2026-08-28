@@ -28,6 +28,8 @@ pub struct Settings {
     pub show_editor_after_capture: bool,
     pub max_history: usize,
     pub confirm_delete: bool,
+    /// Close button sends the app to the tray instead of quitting.
+    pub close_to_tray: bool,
 }
 
 impl Default for Settings {
@@ -47,6 +49,7 @@ impl Default for Settings {
             show_editor_after_capture: true,
             max_history: 10,
             confirm_delete: false,
+            close_to_tray: true,
         }
     }
 }

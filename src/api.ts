@@ -15,6 +15,7 @@ export interface Settings {
   show_editor_after_capture: boolean;
   max_history: number;
   confirm_delete: boolean;
+  close_to_tray: boolean;
 }
 
 export interface HistoryEntry {

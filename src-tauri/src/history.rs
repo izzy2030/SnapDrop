@@ -46,10 +46,18 @@ pub fn enrich_entry_metadata(entry: &mut HistoryEntry) {
     }
 }
 
+/// Remove entries whose files no longer exist on disk. Returns true if any
+/// entry was removed. Keeps the gallery/tray in sync with the folder even
+/// when files are deleted outside the app.
+pub fn prune_missing(entries: &mut Vec<HistoryEntry>) -> bool {
+    let before = entries.len();
+    entries.retain(|e| fs::metadata(&e.path).is_ok());
+    entries.len() != before
+}
+
 pub fn init(app: &AppHandle) -> tauri::Result<()> {
     let mut entries = load(app).unwrap_or_default();
-    // Prune entries whose files no longer exist.
-    entries.retain(|e| fs::metadata(&e.path).is_ok());
+    prune_missing(&mut entries);
     for entry in &mut entries {
         enrich_entry_metadata(entry);
     }
@@ -75,14 +83,25 @@ fn persist(app: &AppHandle, entries: &[HistoryEntry]) {
 pub fn entries(app: &AppHandle) -> Vec<HistoryEntry> {
     if let Some(state) = app.try_state::<HistoryState>() {
         let mut inner = state.inner().0.lock().unwrap();
+        // Prune entries whose files were deleted outside the app (e.g. from
+        // Explorer). Without this the gallery/tray would show stale captures
+        // until restart.
+        let pruned = prune_missing(&mut inner);
         for entry in inner.iter_mut() {
             if entry.size_bytes == 0 || entry.width == 0 {
                 enrich_entry_metadata(entry);
             }
         }
+        if pruned {
+            let snapshot = inner.clone();
+            persist(app, &snapshot);
+            let _ = app.emit("history-updated", ());
+        }
         inner.clone()
     } else {
-        load(app).unwrap_or_default()
+        let mut entries = load(app).unwrap_or_default();
+        prune_missing(&mut entries);
+        entries
     }
 }
 
@@ -150,5 +169,39 @@ mod tests {
         let raw = serde_json::to_string(&e).unwrap();
         let back: HistoryEntry = serde_json::from_str(&raw).unwrap();
         assert_eq!(back.path, e.path);
+    }
+
+    #[test]
+    fn prune_missing_removes_deleted_files() {
+        let dir = std::env::temp_dir().join(format!("snapdrop-history-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("exists.png");
+        std::fs::write(&existing, b"png").unwrap();
+        let missing = dir.join("missing.png");
+
+        let mut entries = vec![
+            HistoryEntry {
+                path: existing.to_string_lossy().into_owned(),
+                captured_at: "2026-08-28T10:00:00".into(),
+                size_bytes: 0,
+                width: 0,
+                height: 0,
+            },
+            HistoryEntry {
+                path: missing.to_string_lossy().into_owned(),
+                captured_at: "2026-08-28T10:00:00".into(),
+                size_bytes: 0,
+                width: 0,
+                height: 0,
+            },
+        ];
+
+        assert!(prune_missing(&mut entries));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, existing.to_string_lossy());
+
+        // Second pass finds nothing to remove.
+        assert!(!prune_missing(&mut entries));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

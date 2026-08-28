@@ -488,6 +488,19 @@ input[type="checkbox"] {
   }
 }
 
+/* Refresh button spin while the history is re-fetching */
+.btn-icon.spinning svg {
+  animation: iconSpin 0.8s linear infinite;
+}
+@keyframes iconSpin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .dropdown-menu-item {
   width: 100%;
   display: flex;
@@ -857,6 +870,37 @@ input[type="checkbox"] {
   gap: 12px;
 }
 
+.shortcut-list {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.shortcut-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.shortcut-label {
+  font-size: 13px;
+  color: var(--text-main);
+}
+
+.shortcut-keys {
+  background: #f1f3f6;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 3px 9px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-main);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
 .hotkey-field {
   min-width: 170px;
   text-align: center;
@@ -925,7 +969,6 @@ input[type="checkbox"] {
   font-weight: 800;
   font-size: 26px;
   margin: 0 auto 12px;
-  box-shadow: 0 4px 14px rgba(255, 106, 0, 0.35);
 }
 
 .about-card h2 {

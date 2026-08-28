@@ -132,12 +132,18 @@ export default function SettingsApp() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [previews, setPreviews] = useState<Record<string, string>>({});
+  const [refreshing, setRefreshing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<Status>(null);
   const [version, setVersion] = useState<string>("");
   const [showMoreMenu, setShowMoreMenu] = useState(false);
   const [debugLog, setDebugLog] = useState<string | null>(null);
   const moreMenuRef = useRef<HTMLDivElement>(null);
+  // Capture files are immutable — a path's preview only needs to be fetched
+  // once per session. Re-fetching all of them on every refresh/focus made the
+  // main window stall at grab time (the "focus" event fires exactly when the
+  // user presses the title bar to drag it).
+  const fetchedPreviews = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     const handleOutsideClick = (e: MouseEvent) => {
@@ -154,12 +160,29 @@ export default function SettingsApp() {
   }, [showMoreMenu]);
 
   const refreshHistory = useCallback(() => {
+    setRefreshing(true);
     api
       .getHistory()
       .then((h) => {
         setHistory(h);
-        // Fetch previews for visible entries asynchronously
+        // Drop previews for entries that no longer exist (e.g. files deleted
+        // outside the app), and fetch previews for visible entries.
+        setPreviews((prev) => {
+          const live = new Set(h.map((e) => e.path));
+          const next: Record<string, string> = {};
+          for (const [k, v] of Object.entries(prev)) {
+            if (live.has(k)) next[k] = v;
+          }
+          // Keep the fetched-set in sync so deleted paths could be re-fetched
+          // if they reappear (unlikely) and new paths get fetched below.
+          for (const k of Array.from(fetchedPreviews.current)) {
+            if (!live.has(k)) fetchedPreviews.current.delete(k);
+          }
+          return next;
+        });
         h.forEach((entry) => {
+          if (fetchedPreviews.current.has(entry.path)) return;
+          fetchedPreviews.current.add(entry.path);
           api
             .getCapturePreview(entry.path)
             .then((preview) => {
@@ -168,10 +191,14 @@ export default function SettingsApp() {
                 return { ...prev, [entry.path]: preview };
               });
             })
-            .catch(() => {});
+            .catch(() => {
+              // Allow a retry on the next refresh if the read failed.
+              fetchedPreviews.current.delete(entry.path);
+            });
         });
       })
-      .catch((e) => console.error("History fetch error:", e));
+      .catch((e) => console.error("History fetch error:", e))
+      .finally(() => setRefreshing(false));
   }, []);
 
   useEffect(() => {
@@ -412,7 +439,7 @@ export default function SettingsApp() {
 
                 <button
                   type="button"
-                  className="btn-icon"
+                  className={`btn-icon${refreshing ? " spinning" : ""}`}
                   onClick={refreshHistory}
                   title="Refresh list"
                 >
@@ -586,7 +613,15 @@ export default function SettingsApp() {
                                     return;
                                   }
                                   await api.deleteCapture(item.path);
-                                  refreshHistory();
+                                  // Update local state immediately instead of a full
+                                  // refresh (which re-fetches every preview) so
+                                  // deleting several captures in a row stays fast.
+                                  setHistory((prev) => prev.filter((e) => e.path !== item.path));
+                                  setPreviews((prev) => {
+                                    const next = { ...prev };
+                                    delete next[item.path];
+                                    return next;
+                                  });
                                 }}
                                 title="Delete capture"
                               >
@@ -687,7 +722,15 @@ export default function SettingsApp() {
                                     return;
                                   }
                                   await api.deleteCapture(item.path);
-                                  refreshHistory();
+                                  // Update local state immediately instead of a full
+                                  // refresh (which re-fetches every preview) so
+                                  // deleting several captures in a row stays fast.
+                                  setHistory((prev) => prev.filter((e) => e.path !== item.path));
+                                  setPreviews((prev) => {
+                                    const next = { ...prev };
+                                    delete next[item.path];
+                                    return next;
+                                  });
                                 }}
                                 title="Delete capture"
                               >
@@ -862,6 +905,32 @@ export default function SettingsApp() {
                 </section>
 
                 <section className="settings-section">
+                  <h2>Keyboard Shortcuts</h2>
+                  <div className="shortcut-list">
+                    <div className="shortcut-item">
+                      <span className="shortcut-label">Capture screenshot</span>
+                      <kbd className="shortcut-keys">{settings.hotkey || "Ctrl+Shift+4"}</kbd>
+                    </div>
+                    <div className="shortcut-item">
+                      <span className="shortcut-label">While selecting: flip annotation editor</span>
+                      <kbd className="shortcut-keys">Hold Ctrl</kbd>
+                    </div>
+                    <div className="shortcut-item">
+                      <span className="shortcut-label">Dismiss floating thumbnail or cancel</span>
+                      <kbd className="shortcut-keys">Esc</kbd>
+                    </div>
+                    <div className="shortcut-item">
+                      <span className="shortcut-label">Editor: confirm and finish</span>
+                      <kbd className="shortcut-keys">Enter</kbd>
+                    </div>
+                    <div className="shortcut-item">
+                      <span className="shortcut-label">Editor: undo last stroke</span>
+                      <kbd className="shortcut-keys">Ctrl+Z</kbd>
+                    </div>
+                  </div>
+                </section>
+
+                <section className="settings-section">
                   <h2>Floating Thumbnail</h2>
                   <div className="field-row">
                     <div>
@@ -939,6 +1008,18 @@ export default function SettingsApp() {
                       type="checkbox"
                       checked={settings.confirm_delete}
                       onChange={(e) => set({ confirm_delete: e.target.checked })}
+                    />
+                  </div>
+
+                  <div className="field-row" style={{ marginTop: 12 }}>
+                    <div>
+                      <span className="field-label">Close button minimizes to tray</span>
+                      <div className="field-hint">When off, pressing X quits the app.</div>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={settings.close_to_tray}
+                      onChange={(e) => set({ close_to_tray: e.target.checked })}
                     />
                   </div>
                 </section>
