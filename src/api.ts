@@ -16,6 +16,7 @@ export interface Settings {
   max_history: number;
   confirm_delete: boolean;
   close_to_tray: boolean;
+  ocr_hotkey: string;
 }
 
 export interface HistoryEntry {
@@ -72,4 +73,5 @@ export const api = {
   reportRendererPointerDown: () => invoke<void>("report_renderer_pointerdown"),
   getDebugLog: () => invoke<string>("get_debug_log"),
   openDebugLog: () => invoke<void>("open_debug_log"),
+  ocrPendingEditorImage: () => invoke<string>("ocr_pending_editor_image"),
 };

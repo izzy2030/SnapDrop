@@ -8,7 +8,7 @@ use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Manager};
 use windows::Win32::Foundation::HWND;
 
-use crate::{clipboard, dragdrop, filename, history, hotkey, settings, thumbnail};
+use crate::{clipboard, dragdrop, filename, history, hotkey, ocr, settings, thumbnail};
 
 /// Decoded-preview cache, keyed by capture path. Capture files are immutable
 /// once written, so a path's preview never changes — decode each screenshot
@@ -65,6 +65,13 @@ pub fn update_settings(app: AppHandle, settings: settings::Settings) -> Result<(
     // Re-register hotkey if it changed (conflict → error, keep old).
     if settings.hotkey != old.hotkey {
         if let Err(e) = hotkey::apply_settings(&app, &settings.hotkey) {
+            return Err(e);
+        }
+    }
+
+    // Same for the OCR hotkey.
+    if settings.ocr_hotkey != old.ocr_hotkey {
+        if let Err(e) = hotkey::apply_ocr_settings(&app, &settings.ocr_hotkey) {
             return Err(e);
         }
     }
@@ -477,6 +484,25 @@ pub fn pause_hotkey(app: AppHandle, paused: bool) -> Result<(), String> {
 #[tauri::command]
 pub fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// OCR the pending editor capture and return the recognized text. Runs on a
+/// worker thread — the recognition blocks for ~100ms+ and must never sit on
+/// the main/UI thread.
+#[tauri::command]
+pub async fn ocr_pending_editor_image() -> Result<String, String> {
+    let Some((bgra, w, h)) = crate::editor::pending_bgra() else {
+        return Err("No pending capture to recognize".into());
+    };
+    tauri::async_runtime::spawn_blocking(move || ocr::recognize(&bgra, w, h))
+        .await
+        .map_err(|e| format!("OCR task failed: {e}"))?
+}
+
+/// Copy plain text to the clipboard (editor OCR result).
+#[tauri::command]
+pub fn copy_text(text: String) -> Result<(), String> {
+    clipboard::set_text(&text)
 }
 
 #[tauri::command]

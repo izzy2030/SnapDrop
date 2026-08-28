@@ -208,12 +208,20 @@ export default function SettingsApp() {
 
     const unCaptured = listen("thumbnail-captured", () => refreshHistory());
     const unHistory = listen("history-updated", () => refreshHistory());
+    // Notifications from Rust (capture results, OCR results, errors). The
+    // floating thumbnail used to be the only listener; show them here too so
+    // they are visible whenever the main window is open.
+    const unToast = listen<{ kind: "info" | "error" | "success"; message: string }>("toast", (e) => {
+      setStatus({ kind: e.payload.kind === "error" ? "error" : "info", text: e.payload.message });
+      window.setTimeout(() => setStatus(null), 5000);
+    });
     const onFocus = () => refreshHistory();
     window.addEventListener("focus", onFocus);
 
     return () => {
       unCaptured.then((f) => f());
       unHistory.then((f) => f());
+      unToast.then((f) => f());
       window.removeEventListener("focus", onFocus);
     };
   }, [refreshHistory]);
@@ -858,6 +866,14 @@ export default function SettingsApp() {
                   </div>
 
                   <div className="field">
+                    <span className="field-label">Text Capture Hotkey (OCR)</span>
+                    <span className="field-hint">Select a region and the recognized text is copied to your clipboard. Offline — nothing leaves your PC.</span>
+                    <div style={{ marginTop: 6 }}>
+                      <HotkeyField value={settings.ocr_hotkey} onChange={(v) => set({ ocr_hotkey: v })} />
+                    </div>
+                  </div>
+
+                  <div className="field">
                     <span className="field-label">Screenshot Directory</span>
                     <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
                       <input
@@ -910,6 +926,10 @@ export default function SettingsApp() {
                     <div className="shortcut-item">
                       <span className="shortcut-label">Capture screenshot</span>
                       <kbd className="shortcut-keys">{settings.hotkey || "Ctrl+Shift+4"}</kbd>
+                    </div>
+                    <div className="shortcut-item">
+                      <span className="shortcut-label">Capture text to clipboard (OCR)</span>
+                      <kbd className="shortcut-keys">{settings.ocr_hotkey || "Ctrl+Shift+5"}</kbd>
                     </div>
                     <div className="shortcut-item">
                       <span className="shortcut-label">While selecting: flip annotation editor</span>

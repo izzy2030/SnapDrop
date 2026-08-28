@@ -11,6 +11,7 @@ mod history;
 mod hotkey;
 mod monitors;
 mod native_thumb;
+mod ocr;
 mod notifier;
 mod overlay;
 mod settings;
@@ -149,6 +150,8 @@ pub fn run() {
             commands::report_renderer_pointerdown,
             commands::get_debug_log,
             commands::open_debug_log,
+            commands::ocr_pending_editor_image,
+            commands::copy_text,
         ])
         .build(tauri::generate_context!())
         .expect("error while building SnapDrop application")

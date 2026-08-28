@@ -119,6 +119,22 @@ pub fn get_pending_image() -> Option<EditorPayload> {
     })
 }
 
+/// The pending capture as tightly-packed BGRA (for OCR). Decoded on demand
+/// from the stored full-resolution PNG.
+pub fn pending_bgra() -> Option<(Vec<u8>, u32, u32)> {
+    let guard = PENDING.lock().unwrap();
+    let p = guard.as_ref()?;
+    let png = base64_decode(&p.full_b64)?;
+    let img = image::load_from_memory(&png).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let mut bgra = Vec::with_capacity((w as usize) * (h as usize) * 4);
+    for px in rgba.pixels() {
+        bgra.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+    }
+    Some((bgra, w, h))
+}
+
 /// Registers the editor's confirm/cancel event listeners. Called once at startup.
 pub fn init(app: &AppHandle) {
     let confirm_app = app.clone();

@@ -18,6 +18,37 @@ const LCS_WINDOWS_COLOR_SPACE: u32 = 2;
 const BI_BITFIELDS: u32 = 3;
 const CF_DIBV5: u32 = 17;
 const CF_HDROP: u32 = 15;
+const CF_UNICODETEXT: u32 = 13;
+
+/// Copy plain text (CF_UNICODETEXT) — used by the OCR capture-to-text flow.
+pub fn set_text(text: &str) -> Result<(), String> {
+    unsafe {
+        if !OpenClipboard(None).is_ok() {
+            return Err("Could not open clipboard".into());
+        }
+        let result = (|| -> Result<(), String> {
+            EmptyClipboard().map_err(|e| e.to_string())?;
+            let mut wide: Vec<u16> = text.encode_utf16().collect();
+            wide.push(0); // NUL terminator required by CF_UNICODETEXT
+            let h = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2).ok().ok_or("Clipboard alloc failed")?;
+            let ptr = GlobalLock(h);
+            if ptr.is_null() {
+                let _ = GlobalFree(Some(h));
+                return Err("Clipboard lock failed".into());
+            }
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr as *mut u16, wide.len());
+            let _ = GlobalUnlock(h);
+            let r = SetClipboardData(CF_UNICODETEXT, Some(HANDLE(h.0)));
+            if r.is_err() {
+                let _ = GlobalFree(Some(h));
+                return Err("Could not set clipboard text".into());
+            }
+            Ok(())
+        })();
+        let _ = CloseClipboard();
+        result
+    }
+}
 
 /// Put both a DIB image and the file itself on the clipboard.
 pub fn set_image_and_file(bgra: &[u8], width: u32, height: u32, path: &Path) -> Result<(), String> {

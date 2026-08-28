@@ -14,7 +14,7 @@ fn to_hwnd(raw: *mut c_void) -> HWND {
 }
 
 use crate::{
-    capture, clipboard, editor, filename, history, monitors, notifier, overlay, settings,
+    capture, clipboard, editor, filename, history, monitors, notifier, ocr, overlay, settings,
     thumbnail, tray,
 };
 
@@ -48,6 +48,27 @@ fn restore_main_window(app: &AppHandle, was_visible: bool, was_minimized: bool) 
     }
 }
 
+/// Hide the main window and floating thumbnails so they never appear in a
+/// capture. Returns the main window's pre-capture visibility state for the
+/// no-activate restore.
+fn hide_for_capture(app: &AppHandle) -> (bool, bool) {
+    let main_win = app.get_webview_window("main");
+    let main_was_visible = main_win
+        .as_ref()
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false);
+    let main_was_minimized = main_win
+        .as_ref()
+        .and_then(|w| w.hwnd().ok())
+        .map(|h| unsafe { IsIconic(to_hwnd(h.0)).as_bool() })
+        .unwrap_or(false);
+    if let Some(main_win) = &main_win {
+        let _ = main_win.hide();
+    }
+    let _ = thumbnail::hide_all(app);
+    (main_was_visible, main_was_minimized)
+}
+
 pub fn run(app: &AppHandle) {
     // The capture flow may run inside a message dispatch on the main thread;
     // contain any panic so it degrades to an error toast instead of killing
@@ -71,23 +92,8 @@ pub fn run(app: &AppHandle) {
 }
 
 fn run_inner(app: &AppHandle) {
-    // Hide main window and floating thumbnails so they never appear in the capture.
-    let main_win = app.get_webview_window("main");
-    let main_was_visible = main_win
-        .as_ref()
-        .and_then(|w| w.is_visible().ok())
-        .unwrap_or(false);
-    let main_was_minimized = main_win
-        .as_ref()
-        .and_then(|w| w.hwnd().ok())
-        .map(|h| unsafe { IsIconic(to_hwnd(h.0)).as_bool() })
-        .unwrap_or(false);
-    if let Some(main_win) = &main_win {
-        let _ = main_win.hide();
-    }
-
     let was_visible = thumbnail::is_visible(app);
-    let _ = thumbnail::hide_all(app);
+    let (main_was_visible, main_was_minimized) = hide_for_capture(app);
 
     // Brief sleep to ensure DWM compositor updates the screen before capture overlay starts
     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -228,4 +234,78 @@ fn run_inner(app: &AppHandle) {
     // bring it back (without stealing focus) so the app only goes to the tray
     // when the user closes it.
     restore_main_window(app, main_was_visible, main_was_minimized);
+}
+
+/// Text capture (OCR hotkey): select a region, recognize the text offline,
+/// put it on the clipboard. Nothing is saved to disk and no thumbnail is
+/// shown — the whole point is the fastest possible screenshot → text.
+pub fn run_text(app: &AppHandle) {
+    crate::debuglog::log("text capture flow: start");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_text_inner(app)));
+    if let Err(payload) = result {
+        crate::debuglog::log(&format!(
+            "text capture flow: PANIC {}",
+            crate::panic_message(&payload)
+        ));
+        log::error!(
+            "text capture flow panicked: {}",
+            crate::panic_message(&payload)
+        );
+        if let Some(main_win) = app.get_webview_window("main") {
+            let _ = main_win.show();
+        }
+        notifier::toast(app, "error", "Text capture failed unexpectedly");
+    }
+}
+
+fn run_text_inner(app: &AppHandle) {
+    let (main_was_visible, main_was_minimized) = hide_for_capture(app);
+
+    // Brief sleep to ensure DWM compositor updates the screen before capture overlay starts
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let Some(sel) = overlay::run(false) else {
+        crate::debuglog::log("text capture flow: overlay cancelled");
+        restore_main_window(app, main_was_visible, main_was_minimized);
+        return;
+    };
+    crate::debuglog::log(&format!("text capture flow: selection rect={:?}", sel.rect));
+
+    let monitors = monitors::enumerate();
+    let Some(img) = capture::capture_region(&sel.rect, &monitors) else {
+        notifier::toast(app, "error", "Couldn't capture screen region");
+        restore_main_window(app, main_was_visible, main_was_minimized);
+        return;
+    };
+
+    // Restore the main window right away (without stealing focus) — OCR runs
+    // on a worker thread and the user shouldn't wait on it.
+    restore_main_window(app, main_was_visible, main_was_minimized);
+
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        match ocr::recognize(&img.bgra, img.width, img.height) {
+            Ok(text) => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    notifier::toast(&app2, "info", "No text found in that region");
+                    return;
+                }
+                match clipboard::set_text(&text) {
+                    Ok(()) => {
+                        let chars = trimmed.chars().count();
+                        let preview: String = trimmed.chars().take(80).collect();
+                        let ellipsis = if chars > 80 { "…" } else { "" };
+                        notifier::toast(
+                            &app2,
+                            "success",
+                            &format!("Text copied ({chars} chars): {preview}{ellipsis}"),
+                        );
+                    }
+                    Err(e) => notifier::toast(&app2, "error", &format!("Clipboard failed: {e}")),
+                }
+            }
+            Err(e) => notifier::toast(&app2, "error", &e),
+        }
+    });
 }

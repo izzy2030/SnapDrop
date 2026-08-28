@@ -17,8 +17,15 @@ static ESC_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 pub struct CurrentShortcut(pub Mutex<Option<Shortcut>>);
 
+pub struct CurrentOcrShortcut(pub Mutex<Option<Shortcut>>);
+
 pub fn current(app: &AppHandle) -> Option<Shortcut> {
     app.try_state::<CurrentShortcut>()
+        .and_then(|s| s.inner().0.lock().unwrap().clone())
+}
+
+pub fn current_ocr(app: &AppHandle) -> Option<Shortcut> {
+    app.try_state::<CurrentOcrShortcut>()
         .and_then(|s| s.inner().0.lock().unwrap().clone())
 }
 
@@ -50,6 +57,24 @@ pub fn init(app: &AppHandle) {
                 ),
             );
         }
+    }
+
+    // OCR hotkey: capture a region and copy the recognized text.
+    let ocr_shortcut = match parse_shortcut(&settings.ocr_hotkey) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("invalid ocr hotkey in settings: {e}; using default");
+            Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Digit5)
+        }
+    };
+    app.manage(CurrentOcrShortcut(Mutex::new(Some(ocr_shortcut.clone()))));
+    match app.global_shortcut().on_shortcut(ocr_shortcut.clone(), |app, _sc, event| {
+        if event.state() == ShortcutState::Pressed {
+            trigger_capture_text(app);
+        }
+    }) {
+        Ok(()) => log::info!("ocr hotkey registered: {}", shortcut_to_string(&ocr_shortcut)),
+        Err(e) => log::warn!("ocr hotkey registration failed (conflict?): {e}"),
     }
 
     // Esc dismisses the floating thumbnail (registered once; acts only while
@@ -94,6 +119,32 @@ pub fn trigger_capture(app: &AppHandle) {
     });
 }
 
+/// OCR variant of `trigger_capture`: same reentrancy guard and main-thread
+/// hop, but the flow ends with recognized text on the clipboard instead of
+/// an image file + thumbnail.
+pub fn trigger_capture_text(app: &AppHandle) {
+    if CAPTURING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        let app3 = app2.clone();
+        let sent = app2.run_on_main_thread(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                capture_flow::run_text(&app3);
+            }));
+            if let Err(payload) = result {
+                log::error!("text capture flow panicked: {}", crate::panic_message(&payload));
+                let _ = notifier::toast(&app3, "error", "Text capture failed unexpectedly");
+            }
+            CAPTURING.store(false, Ordering::SeqCst);
+        });
+        if sent.is_err() {
+            CAPTURING.store(false, Ordering::SeqCst);
+        }
+    });
+}
+
 /// Re-register the hotkey from settings (used by update_settings). Returns Err on conflict.
 pub fn apply_settings(app: &AppHandle, hotkey_str: &str) -> Result<(), String> {
     let shortcut = parse_shortcut(hotkey_str)?;
@@ -123,12 +174,44 @@ pub fn apply_settings(app: &AppHandle, hotkey_str: &str) -> Result<(), String> {
 
 pub fn pause(app: &AppHandle, paused: bool) {
     let sc = current(app);
+    let osc = current_ocr(app);
     if paused {
         if let Some(s) = &sc {
             let _ = app.global_shortcut().unregister(s.clone());
         }
-    } else if let Some(s) = &sc {
-        let _ = app.global_shortcut().register(s.clone());
+        if let Some(s) = &osc {
+            let _ = app.global_shortcut().unregister(s.clone());
+        }
+    } else {
+        if let Some(s) = &sc {
+            let _ = app.global_shortcut().register(s.clone());
+        }
+        if let Some(s) = &osc {
+            let _ = app.global_shortcut().register(s.clone());
+        }
+    }
+}
+
+/// Re-register the OCR hotkey from settings. Returns Err on conflict.
+pub fn apply_ocr_settings(app: &AppHandle, hotkey_str: &str) -> Result<(), String> {
+    let shortcut = parse_shortcut(hotkey_str)?;
+    let old = current_ocr(app);
+    if let Some(o) = &old {
+        let _ = app.global_shortcut().unregister(o.clone());
+    }
+    match app.global_shortcut().register(shortcut.clone()) {
+        Ok(()) => {
+            if let Some(state) = app.try_state::<CurrentOcrShortcut>() {
+                *state.inner().0.lock().unwrap() = Some(shortcut);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if let Some(o) = &old {
+                let _ = app.global_shortcut().register(o.clone());
+            }
+            Err(format!("Could not register {hotkey_str}: {e}"))
+        }
     }
 }
 

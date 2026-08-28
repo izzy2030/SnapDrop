@@ -36,6 +36,9 @@ function EditorApp() {
   const strokesRef = useRef<Stroke[]>([]);
   const [fit, setFit] = useState({ w: 320, h: 200, scale: 1 });
   const [ready, setReady] = useState(false);
+  const [ocrBusy, setOcrBusy] = useState(false);
+  const [ocrMsg, setOcrMsg] = useState<string | null>(null);
+  const ocrTimerRef = useRef<number | null>(null);
 
   const baseImageRef = useRef<HTMLImageElement | null>(null);
   const activeRef = useRef<Map<number, Stroke>>(new Map());
@@ -173,6 +176,33 @@ function EditorApp() {
     });
   };
 
+  // OCR: recognize text in the capture (offline Windows OCR) and copy it to
+  // the clipboard. Feedback via a transient chip since the editor has no
+  // toast system of its own.
+  const runOcr = async () => {
+    if (ocrBusy || !ready) return;
+    setOcrBusy(true);
+    setOcrMsg("Recognizing text…");
+    const done = (msg: string) => {
+      setOcrBusy(false);
+      setOcrMsg(msg);
+      if (ocrTimerRef.current) window.clearTimeout(ocrTimerRef.current);
+      ocrTimerRef.current = window.setTimeout(() => setOcrMsg(null), 4000);
+    };
+    try {
+      const text = ((await invoke<string>("ocr_pending_editor_image")) ?? "").trim();
+      if (!text) {
+        done("No text found");
+        return;
+      }
+      const chars = text.length;
+      await invoke("copy_text", { text });
+      done(`Copied ${chars} characters to clipboard`);
+    } catch (e) {
+      done(`OCR failed: ${String(e)}`);
+    }
+  };
+
   const confirmingRef = useRef(false);
 
   const confirmEdit = useCallback(async () => {
@@ -215,6 +245,16 @@ function EditorApp() {
           <span className="tool-glyph">🗑</span>
         </button>
         <div className="toolbar-sep" />
+        <button
+          type="button"
+          className={`tool-btn${ocrBusy ? " active" : ""}`}
+          title="Copy text from image (OCR)"
+          onClick={() => void runOcr()}
+          disabled={!ready || ocrBusy}
+        >
+          <span className="tool-glyph">🔤</span>
+        </button>
+        <div className="toolbar-sep" />
         <div className="color-row">
           {PALETTE.map((c) => (
             <button
@@ -235,6 +275,8 @@ function EditorApp() {
           <span className="tool-glyph">✕</span>
         </button>
       </div>
+
+      {ocrMsg && <div className="editor-ocr-chip">{ocrMsg}</div>}
 
       <div className="editor-canvas-wrap">
         <canvas

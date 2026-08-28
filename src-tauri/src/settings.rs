@@ -30,6 +30,8 @@ pub struct Settings {
     pub confirm_delete: bool,
     /// Close button sends the app to the tray instead of quitting.
     pub close_to_tray: bool,
+    /// Global hotkey: capture a region and copy the recognized text (OCR).
+    pub ocr_hotkey: String,
 }
 
 impl Default for Settings {
@@ -50,6 +52,7 @@ impl Default for Settings {
             max_history: 10,
             confirm_delete: false,
             close_to_tray: true,
+            ocr_hotkey: "Ctrl+Shift+5".into(),
         }
     }
 }
