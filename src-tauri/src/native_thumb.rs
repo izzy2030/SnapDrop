@@ -85,12 +85,6 @@ enum Cmd {
     Present(Box<PresentEntry>, (u32, u32), Option<(i32, i32)>, u64),
     Hide,
     Show,
-    DragOutcome {
-        capture_id: u64,
-        dropped: bool,
-        moved: bool,
-        hide_after_drop: bool,
-    },
     Open(String),
     Reveal(String),
 }
@@ -319,7 +313,7 @@ unsafe extern "system" fn thumb_wndproc(
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
-            on_button_down(lparam);
+            on_button_down(hwnd, lparam);
             LRESULT(0)
         }
         WM_LBUTTONDBLCLK => {
@@ -379,46 +373,6 @@ unsafe fn handle_cmd(hwnd: HWND, cmd: Cmd) {
         Cmd::Show => {
             let pos = state().lock().unwrap().pos;
             show_at(hwnd, current_window_size(), pos);
-        }
-        Cmd::DragOutcome {
-            capture_id,
-            dropped,
-            moved,
-            hide_after_drop,
-        } => {
-            let mut guard = state().lock().unwrap();
-            let st = &mut *guard;
-            if moved && stack_remove(&mut st.stack, &mut st.seen, capture_id) {
-                if st.stack.is_empty() {
-                    drop(guard);
-                    let _ = ShowWindow(hwnd, SW_HIDE);
-                    return;
-                }
-                st.expanded = false;
-                drop(guard);
-                show_at(hwnd, current_window_size(), None);
-                unsafe {
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
-            } else if dropped && hide_after_drop {
-                drop(guard);
-                let _ = ShowWindow(hwnd, SW_HIDE);
-            } else if !dropped && !moved {
-                // Plain click: toggle the expanded list (if more than one).
-                let suppress = now_ms().saturating_sub(st.last_dbl_ms) < 700;
-                if !suppress && st.stack.len() > 1 {
-                    st.expanded = !st.expanded;
-                    let expanded = st.expanded;
-                    drop(guard);
-                    show_at(hwnd, current_window_size(), None);
-                    crate::debuglog::log(&format!(
-                        "native_thumb: expanded={expanded}"
-                    ));
-                }
-                unsafe {
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
-            }
         }
         Cmd::Open(path) => {
             if let Some(handle) = APP.get().cloned() {
@@ -538,7 +492,7 @@ fn entry_id(idx: usize) -> u64 {
     st.stack.get(idx).map(|e| e.capture_id).unwrap_or(0)
 }
 
-unsafe fn on_button_down(lparam: LPARAM) {
+unsafe fn on_button_down(hwnd: HWND, lparam: LPARAM) {
     let y = (lparam.0 >> 16) as u16 as i32; // client coords, physical
     let ctrl = key_down(VK_CONTROL.0 as i32)
         || key_down(VK_MENU.0 as i32)
@@ -556,7 +510,76 @@ unsafe fn on_button_down(lparam: LPARAM) {
     };
     let id = entry_id(idx);
     crate::debuglog::log(&format!("native_thumb: drag start id={id} path={path}"));
-    start_drag_job(id, path);
+    let Some(app) = APP.get().cloned() else {
+        return;
+    };
+    // Run the OLE drag on THIS thread — the one that received the button-down.
+    // DoDragDrop needs the mouse input stream of the thread that got the press:
+    // called from any other thread, its modal loop never sees the move or the
+    // release and hangs forever (observed with the Tauri main thread). It pumps
+    // this thread's messages while it runs, so the window keeps painting; this
+    // handler just doesn't return until the drag ends.
+    let outcome = crate::commands::start_drag(app.clone(), path.clone());
+    if let Err(e) = &outcome {
+        crate::debuglog::log(&format!("native_thumb: drag ERROR {e}"));
+    }
+    let (dropped, moved) = outcome
+        .map(|o| (o.dropped, o.moved))
+        .unwrap_or((false, false));
+    crate::debuglog::log(&format!(
+        "native_thumb: drag done path={path} dropped={dropped} moved={moved}"
+    ));
+    let hide_after_drop = crate::settings::get(&app).hide_after_drop;
+    handle_drag_outcome(hwnd, id, dropped, moved, hide_after_drop);
+}
+
+/// Apply a finished drag's outcome: remove the card on move-effect, hide on a
+/// successful drop (per settings), and toggle the expanded list on a plain
+/// click (press + release without movement).
+fn handle_drag_outcome(
+    hwnd: HWND,
+    capture_id: u64,
+    dropped: bool,
+    moved: bool,
+    hide_after_drop: bool,
+) {
+    let mut guard = state().lock().unwrap();
+    let st = &mut *guard;
+    if moved && stack_remove(&mut st.stack, &mut st.seen, capture_id) {
+        if st.stack.is_empty() {
+            drop(guard);
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            return;
+        }
+        st.expanded = false;
+        drop(guard);
+        unsafe {
+            show_at(hwnd, current_window_size(), None);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    } else if dropped && hide_after_drop {
+        drop(guard);
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    } else if !dropped && !moved {
+        // Plain click: toggle the expanded list (if more than one).
+        let suppress = now_ms().saturating_sub(st.last_dbl_ms) < 700;
+        if !suppress && st.stack.len() > 1 {
+            st.expanded = !st.expanded;
+            let expanded = st.expanded;
+            drop(guard);
+            unsafe {
+                show_at(hwnd, current_window_size(), None);
+            }
+            crate::debuglog::log(&format!("native_thumb: expanded={expanded}"));
+        }
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
 }
 
 unsafe fn on_double_click(hwnd: HWND, lparam: LPARAM) {
@@ -598,38 +621,6 @@ unsafe fn on_button_up(lparam: LPARAM) {
 
 fn key_down(vk: i32) -> bool {
     unsafe { (GetAsyncKeyState(vk) as u16) & 0x8000 != 0 }
-}
-
-/// Run the OLE drag on the Tauri main thread (same thread as the webview path
-/// uses — Chromium-based drop targets reject drags from other threads) and
-/// feed the outcome back to the window thread.
-fn start_drag_job(capture_id: u64, path: String) {
-    let Some(app) = APP.get() else { return };
-    let app2 = app.clone();
-    let sent = app.run_on_main_thread(move || {
-        let outcome = crate::commands::start_drag(app2.clone(), path.clone());
-        let (dropped, moved) = outcome
-            .map(|o| (o.dropped, o.moved))
-            .unwrap_or((false, false));
-        crate::debuglog::log(&format!(
-            "native_thumb: drag done path={path} dropped={dropped} moved={moved}"
-        ));
-        let hide_after_drop = crate::settings::get(&app2).hide_after_drop;
-        let raw = Box::into_raw(Box::new(Cmd::DragOutcome {
-            capture_id,
-            dropped,
-            moved,
-            hide_after_drop,
-        }));
-        if let Some(&h) = HWND_SLOT.get() {
-            unsafe {
-                let _ = PostMessageW(Some(hwnd_from(h)), WM_APP_CMD, WPARAM(0), LPARAM(raw as isize));
-            }
-        }
-    });
-    if sent.is_err() {
-        crate::debuglog::log("native_thumb: drag job not sent (event loop gone)");
-    }
 }
 
 // ---------------------------------------------------------------------------

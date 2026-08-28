@@ -22,15 +22,16 @@ use windows::Win32::Graphics::Gdi::{
     BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC, HBITMAP,
 };
 use windows::Win32::System::Com::{
-    CoInitializeEx, CoUninitialize, DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink,
+    DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink,
     IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumFORMATETC_Impl, IEnumSTATDATA,
-    STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL, COINIT_APARTMENTTHREADED,
+    STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
 };
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT,
 };
 use windows::Win32::System::Ole::{
-    CF_HDROP, DoDragDrop, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE, IDropSource, IDropSource_Impl,
+    CF_HDROP, DoDragDrop, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE, IDropSource,
+    IDropSource_Impl, OleInitialize, OleUninitialize,
 };
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -82,6 +83,7 @@ pub fn start_drag(_app: &tauri::AppHandle, path: &str) -> Result<DragOutcome, St
 }
 
 fn start_drag_inner(path: &str) -> Result<DragOutcome, String> {
+    crate::debuglog::log("drag: inner enter");
     if !Path::new(path).exists() {
         return Err("File not found".into());
     }
@@ -99,6 +101,7 @@ fn start_drag_inner(path: &str) -> Result<DragOutcome, String> {
     });
 
     let moved = rx.recv().map_err(|e| e.to_string())?;
+    crate::debuglog::log(&format!("drag: poll returned moved={moved}"));
     if !moved {
         return Ok(DragOutcome {
             dropped: false,
@@ -115,7 +118,12 @@ fn start_drag_inner(path: &str) -> Result<DragOutcome, String> {
 /// drag-source window is created on this thread, and the drag image is built
 /// and destroyed here too (GDI objects are thread-affine).
 unsafe fn run_drag_inline(path: &str) -> DragOutcome {
-    let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    // The shell drag needs full OLE initialization (OleInitialize wraps
+    // CoInitializeEx STA and adds the clipboard/drag services DoDragDrop
+    // requires). Plain CoInitializeEx made SHDoDragDrop fail instantly with
+    // CO_E_NOTINITIALIZED on threads the runtime hadn't OLE-initialized.
+    let ole_hr = OleInitialize(None);
+    crate::debuglog::log(&format!("drag: OleInitialize -> {ole_hr:?}"));
     let hwnd = create_drag_source_window();
 
     let data: IDataObject = DropData {
@@ -128,6 +136,7 @@ unsafe fn run_drag_inline(path: &str) -> DragOutcome {
     let ok_effects = DROPEFFECT_COPY | DROPEFFECT_MOVE;
 
     let drag_image = build_drag_image(path);
+    crate::debuglog::log("drag: entering SHDoDragDrop/DoDragDrop modal loop");
 
     let hr = match &drag_image {
         Some((bmp, _hdc, size, offset)) => {
@@ -160,13 +169,16 @@ unsafe fn run_drag_inline(path: &str) -> DragOutcome {
     };
 
     eprintln!("[snapdrop] drag: DoDragDrop finished, hr={hr:?} effect={effect:?}");
+    crate::debuglog::log(&format!("drag: modal loop returned hr={hr:?} effect={effect:?}"));
 
     if let Some((bmp, hdc, _, _)) = drag_image {
         let _ = DeleteObject(bmp.into());
         let _ = DeleteDC(hdc);
     }
     let _ = DestroyWindow(hwnd);
-    CoUninitialize();
+    if ole_hr.is_ok() {
+        OleUninitialize();
+    }
 
     let dropped = hr == DRAGDROP_S_DROP;
     let moved = dropped && effect.contains(DROPEFFECT_MOVE);
