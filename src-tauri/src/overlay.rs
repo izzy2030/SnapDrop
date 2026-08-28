@@ -5,7 +5,7 @@
 //! All coordinates are physical pixels in virtual-screen space.
 
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use windows::core::PCWSTR;
@@ -19,14 +19,15 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_ESCAPE,
+    GetAsyncKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_ESCAPE, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-    LoadCursorW, PostMessageW, RegisterClassExW, SetForegroundWindow, ShowWindow, TranslateMessage,
-    UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, IDC_CROSS, MSG, SW_SHOW, ULW_ALPHA, WM_APP,
-    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    KillTimer, LoadCursorW, PostMessageW, RegisterClassExW, SetForegroundWindow, SetTimer,
+    ShowWindow, TranslateMessage, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, IDC_CROSS, MSG,
+    SW_SHOW, ULW_ALPHA, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_NCHITTEST, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::monitors::{self, MonitorInfo};
@@ -41,8 +42,14 @@ pub static RUNNING: AtomicBool = AtomicBool::new(false);
 /// "annotate"). Set once per capture before the overlay starts.
 static EDITOR_ENABLED: AtomicBool = AtomicBool::new(true);
 
+/// The configured delay duration in seconds; held-Shift during the selection
+/// arms the delayed capture (open menus/tooltips before the shot fires).
+static DELAY_SECS: AtomicU32 = AtomicU32::new(0);
+
 const CLASS_NAME: &str = "SnapDropOverlayClass";
 const WM_OVERLAY_DONE: u32 = WM_APP + 1;
+const TIMER_COUNTDOWN: usize = 1;
+const HTTRANSPARENT: i32 = -1;
 const DIM_ALPHA: u32 = 96;
 const BORDER_COLOR: u32 = 0xFF_2F_7B_F6; // premultiplied ARGB
 const GUIDE_COLOR: u32 = 0x8C_FF_FF_FF; // premultiplied white, alpha 140
@@ -56,6 +63,8 @@ pub struct Selection {
     /// capture flow flips the editor decision from the current setting: with
     /// the editor enabled Ctrl skips it, with it disabled Ctrl opens it.
     pub ctrl_held: bool,
+    /// True when Shift was held at selection time — arms the delayed capture.
+    pub shift_held: bool,
 }
 
 struct OverlayState {
@@ -70,6 +79,17 @@ struct OverlayState {
     bmp: HBITMAP,
     bits: *mut u8,
     monitors: Vec<MonitorInfo>,
+    /// Seconds to wait after the selection is released before capturing
+    /// (0 = capture immediately).
+    delayed_secs: u32,
+    /// True while the countdown runs: the overlay is click-through and shows
+    /// only a ghost outline + remaining seconds so the user can interact with
+    /// the app below (e.g. open a dropdown) before the shot fires.
+    counting: bool,
+    countdown: i32,
+    /// The finalized selection (virtual coords) captured at mouse-up.
+    sel_rect: RECT,
+    sel_ctrl: bool,
 }
 
 // Only ever touched on the main thread (nested loop during capture).
@@ -96,6 +116,11 @@ fn state() -> &'static Mutex<OverlayState> {
             bmp: HBITMAP::default(),
             bits: std::ptr::null_mut(),
             monitors: Vec::new(),
+            delayed_secs: 0,
+            counting: false,
+            countdown: 0,
+            sel_rect: RECT::default(),
+            sel_ctrl: false,
         })
     })
 }
@@ -190,24 +215,79 @@ unsafe fn overlay_wndproc_inner(
                 })
                 .unwrap_or(false);
             let ctrl_held = is_ctrl_down();
+            let shift_held = is_shift_down();
             crate::debuglog::log(&format!(
-                "overlay: mouse up, selection_ok={} ctrl_held={}",
-                ok, ctrl_held
+                "overlay: mouse up, selection_ok={} ctrl_held={} shift_held={}",
+                ok, ctrl_held, shift_held
             ));
             {
                 let mut st = lock_state();
-                st.done = true;
-                st.result = Some(if ok {
-                    Some(Selection {
-                        rect: sel.unwrap(),
-                        ctrl_held,
-                    })
+                if ok && shift_held && st.delayed_secs > 0 {
+                    // Delayed capture: keep the selection, go click-through and
+                    // start the countdown. The user can now interact with the
+                    // app below (open the menu/tooltip) before the shot fires.
+                    st.sel_rect = sel.unwrap();
+                    st.sel_ctrl = ctrl_held;
+                    st.start = None;
+                    st.counting = true;
+                    st.countdown = st.delayed_secs as i32;
+                    let _ = SetFocus(None);
+                    let _ = SetTimer(Some(hwnd), TIMER_COUNTDOWN, 1000, None);
+                    crate::debuglog::log(&format!(
+                        "overlay: countdown started ({}s, shift-held)",
+                        st.delayed_secs
+                    ));
                 } else {
-                    None
-                });
+                    st.done = true;
+                    st.result = Some(if ok {
+                        Some(Selection {
+                            rect: sel.unwrap(),
+                            ctrl_held,
+                            shift_held,
+                        })
+                    } else {
+                        None
+                    });
+                    wake_loop(hwnd);
+                }
             }
-            wake_loop(hwnd);
+            redraw();
             LRESULT(0)
+        }
+        WM_TIMER if wparam.0 as usize == TIMER_COUNTDOWN => {
+            {
+                let mut st = lock_state();
+                if st.counting {
+                    st.countdown -= 1;
+                    if st.countdown <= 0 {
+                        st.counting = false;
+                        let _ = KillTimer(Some(hwnd), TIMER_COUNTDOWN);
+                        st.done = true;
+                        st.result = Some(Some(Selection {
+                            rect: st.sel_rect,
+                            ctrl_held: st.sel_ctrl,
+                            shift_held: true, // countdown only arms on Shift
+                        }));
+                        crate::debuglog::log("overlay: countdown finished -> capture");
+                        wake_loop(hwnd);
+                    } else {
+                        crate::debuglog::log(&format!("overlay: countdown {}", st.countdown));
+                    }
+                }
+            }
+            // NOTE: the state guard must be dropped before redraw() — it locks
+            // the same mutex and std::sync::Mutex is not reentrant (deadlock).
+            redraw();
+            LRESULT(0)
+        }
+        // Click-through while the countdown runs: mouse events fall through to
+        // the window(s) below so the user can keep interacting with the app.
+        WM_NCHITTEST => {
+            if lock_state().counting {
+                LRESULT(HTTRANSPARENT as isize)
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
         }
         WM_KEYDOWN if wparam.0 as u32 == VK_ESCAPE.0 as u32 => {
             cancel();
@@ -228,6 +308,12 @@ fn cancel() {
     if !st.done {
         st.done = true;
         st.result = Some(None);
+        if st.counting {
+            st.counting = false;
+            unsafe {
+                let _ = KillTimer(Some(st.hwnd), TIMER_COUNTDOWN);
+            }
+        }
         wake_loop(st.hwnd);
     }
 }
@@ -237,6 +323,10 @@ fn cancel() {
 /// focus (a background app can't always steal the foreground).
 fn is_ctrl_down() -> bool {
     unsafe { (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16) & 0x8000 != 0 }
+}
+
+fn is_shift_down() -> bool {
+    unsafe { (GetAsyncKeyState(VK_SHIFT.0 as i32) as u16) & 0x8000 != 0 }
 }
 
 /// Dismiss the overlay from outside the window proc (e.g. the global Esc
@@ -273,9 +363,19 @@ fn make_selection(a: POINT, b: POINT) -> RECT {
 
 /// Run the capture overlay. Returns the selection (virtual-screen coords) or None if cancelled.
 /// `editor_enabled` is the current "annotate before showing thumbnail" setting;
-/// the overlay uses it to label the Ctrl modifier correctly.
-pub fn run(editor_enabled: bool) -> Option<Selection> {
+/// the overlay uses it to label the Ctrl modifier correctly. `delay_secs` is
+/// the configured delayed-capture duration: holding Shift while selecting
+/// arms the countdown (click-through + ghost outline, Esc cancels) so the
+/// user can open menus/tooltips before the shot fires.
+pub fn run(editor_enabled: bool, delay_secs: u32) -> Option<Selection> {
     EDITOR_ENABLED.store(editor_enabled, Ordering::SeqCst);
+    DELAY_SECS.store(delay_secs, Ordering::SeqCst);
+    {
+        let mut st = lock_state();
+        st.delayed_secs = delay_secs;
+        st.counting = false;
+        st.countdown = delay_secs as i32;
+    }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_inner));
     match result {
         Ok(sel) => sel,
@@ -355,19 +455,21 @@ fn run_inner() -> Option<Selection> {
         let _ = SelectObject(mem_dc, bmp.into());
 
         {
-            let mut st = lock_state();
-            st.hwnd = hwnd;
-            st.width = w;
-            st.height = h;
-            st.start = None;
-            st.cur = cursor_pos();
-            st.done = false;
-            st.result = None;
-            st.mem_dc = mem_dc;
-            st.bmp = bmp;
-            st.bits = bits as *mut u8;
-            st.monitors = monitors;
-        }
+        let mut st = lock_state();
+        st.hwnd = hwnd;
+        st.width = w;
+        st.height = h;
+        st.start = None;
+        st.cur = cursor_pos();
+        st.done = false;
+        st.result = None;
+        st.mem_dc = mem_dc;
+        st.bmp = bmp;
+        st.bits = bits as *mut u8;
+        st.monitors = monitors;
+        st.counting = false;
+        st.countdown = st.delayed_secs as i32;
+    }
 
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
@@ -395,6 +497,7 @@ fn run_inner() -> Option<Selection> {
             }
         }
         RUNNING.store(false, Ordering::SeqCst);
+        let _ = KillTimer(Some(hwnd), TIMER_COUNTDOWN);
 
         let result = lock_state().result.take();
         let _ = DestroyWindow(hwnd);
@@ -426,7 +529,40 @@ fn redraw() {
 
     let scale = cursor_monitor_scale(&st);
 
-    if let Some(start) = st.start {
+    if st.counting {
+        // Delayed-capture countdown: fully transparent (no dim) so the user
+        // sees and can interact with the app below. Show only a ghost outline
+        // of the selection, the remaining seconds in the center, and a hint.
+        buf.fill(0);
+        let rect = st.sel_rect;
+        let bx0 = (rect.left - virt.left).max(0) as usize;
+        let by0 = (rect.top - virt.top).max(0) as usize;
+        let bx1 = (rect.right - virt.left).min(w as i32) as usize;
+        let by1 = (rect.bottom - virt.top).min(h as i32) as usize;
+        stroke_rect(buf, w, h, bx0, by0, bx1, by1, BORDER_COLOR, BORDER_T);
+        let cx = (rect.left + rect.right) / 2;
+        let cy = (rect.top + rect.bottom) / 2;
+        draw_pill_text(
+            buf,
+            w,
+            h,
+            &virt,
+            cx,
+            cy - 24,
+            &format!("{}  •  Esc to cancel", st.countdown.max(0)),
+            44,
+        );
+        draw_pill_text(
+            buf,
+            w,
+            h,
+            &virt,
+            virt.left + w as i32 / 2,
+            virt.top + 28,
+            "Capturing selection…",
+            15,
+        );
+    } else if let Some(start) = st.start {
         let rect = make_selection(start, st.cur);
 
         // Transparent hole.
@@ -489,22 +625,20 @@ fn redraw() {
             st.cur.x,
             y_pos,
             &text,
+            15,
         );
     } else {
         // Hint before the first click.
-        draw_pill_text(
-            buf,
-            w,
-            h,
-            &virt,
-            virt.left + w as i32 / 2,
-            virt.top + 28,
-            if EDITOR_ENABLED.load(Ordering::SeqCst) {
-                "Drag to select   •   Esc to cancel   •   Ctrl: skip editor"
-            } else {
-                "Drag to select   •   Esc to cancel   •   Ctrl: annotate"
-            },
-        );
+        let mut hint = if EDITOR_ENABLED.load(Ordering::SeqCst) {
+            "Drag to select   •   Esc to cancel   •   Ctrl: skip editor".to_string()
+        } else {
+            "Drag to select   •   Esc to cancel   •   Ctrl: annotate".to_string()
+        };
+        let d = DELAY_SECS.load(Ordering::SeqCst);
+        if d > 0 {
+            hint.push_str(&format!("   •   Shift: {}s delay", d));
+        }
+        draw_pill_text(buf, w, h, &virt, virt.left + w as i32 / 2, virt.top + 28, &hint, 15);
     }
 
     unsafe {
@@ -590,8 +724,9 @@ fn draw_pill_text(
     anchor_x: i32,
     y_pos: i32,
     text: &str,
+    font_h: i32,
 ) {
-    let font_h = 15i32;
+    let font_h = font_h;
     unsafe {
         let mem_dc = CreateCompatibleDC(None);
         if mem_dc.is_invalid() {

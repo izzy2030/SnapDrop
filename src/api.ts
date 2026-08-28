@@ -17,6 +17,7 @@ export interface Settings {
   confirm_delete: boolean;
   close_to_tray: boolean;
   ocr_hotkey: string;
+  capture_delay_secs: number;
 }
 
 export interface HistoryEntry {

@@ -918,6 +918,21 @@ export default function SettingsApp() {
                       onChange={(e) => set({ show_editor_after_capture: e.target.checked })}
                     />
                   </div>
+
+                  <div className="field" style={{ marginTop: 12 }}>
+                    <span className="field-label">Shift+select delay (seconds)</span>
+                    <span className="field-hint">Hold Shift while selecting to capture after this delay — open menus and tooltips before the shot fires. 0 = Shift does nothing (instant capture).</span>
+                    <input
+                      type="number"
+                      style={{ width: 140, marginTop: 4 }}
+                      min={0}
+                      max={60}
+                      value={settings.capture_delay_secs}
+                      onChange={(e) =>
+                        set({ capture_delay_secs: Math.max(0, Math.min(60, Number(e.target.value) || 0)) })
+                      }
+                    />
+                  </div>
                 </section>
 
                 <section className="settings-section">
@@ -934,6 +949,10 @@ export default function SettingsApp() {
                     <div className="shortcut-item">
                       <span className="shortcut-label">While selecting: flip annotation editor</span>
                       <kbd className="shortcut-keys">Hold Ctrl</kbd>
+                    </div>
+                    <div className="shortcut-item">
+                      <span className="shortcut-label">While selecting: delayed capture (fire after countdown)</span>
+                      <kbd className="shortcut-keys">Hold Shift</kbd>
                     </div>
                     <div className="shortcut-item">
                       <span className="shortcut-label">Dismiss floating thumbnail or cancel</span>

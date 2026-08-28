@@ -32,6 +32,10 @@ pub struct Settings {
     pub close_to_tray: bool,
     /// Global hotkey: capture a region and copy the recognized text (OCR).
     pub ocr_hotkey: String,
+    /// Seconds to wait after selecting the area before the shot fires.
+    /// 0 = capture immediately on release. Delayed capture exists so the
+    /// user can open menus/tooltips before the screenshot is taken.
+    pub capture_delay_secs: u32,
 }
 
 impl Default for Settings {
@@ -53,6 +57,9 @@ impl Default for Settings {
             confirm_delete: false,
             close_to_tray: true,
             ocr_hotkey: "Ctrl+Shift+5".into(),
+            // Duration of the delayed capture, armed by holding Shift while
+            // selecting. 0 = Shift does nothing (instant capture).
+            capture_delay_secs: 3,
         }
     }
 }

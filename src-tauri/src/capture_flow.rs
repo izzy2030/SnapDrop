@@ -102,7 +102,9 @@ fn run_inner(app: &AppHandle) {
     // its Ctrl hint, and nothing here changes mid-capture.
     let settings = settings::get(app);
 
-    let sel = match overlay::run(settings.show_editor_after_capture) {
+    // The overlay handles delayed capture itself: holding Shift while
+    // selecting arms the countdown (duration from the setting).
+    let sel = match overlay::run(settings.show_editor_after_capture, settings.capture_delay_secs) {
         Some(s) => s,
         None => {
             crate::debuglog::log("capture flow: overlay cancelled");
@@ -114,6 +116,12 @@ fn run_inner(app: &AppHandle) {
             return;
         }
     };
+    if sel.shift_held && settings.capture_delay_secs > 0 {
+        crate::debuglog::log(&format!(
+            "capture flow: delayed capture active ({}s, shift-held)",
+            settings.capture_delay_secs
+        ));
+    }
     crate::debuglog::log(&format!(
         "capture flow: selection rect={:?} ctrl_held={} show_editor_setting={} -> editor={}",
         sel.rect,
@@ -264,7 +272,7 @@ fn run_text_inner(app: &AppHandle) {
     // Brief sleep to ensure DWM compositor updates the screen before capture overlay starts
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    let Some(sel) = overlay::run(false) else {
+    let Some(sel) = overlay::run(false, 0) else {
         crate::debuglog::log("text capture flow: overlay cancelled");
         restore_main_window(app, main_was_visible, main_was_minimized);
         return;

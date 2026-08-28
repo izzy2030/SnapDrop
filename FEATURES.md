@@ -6,13 +6,17 @@ them somewhere yourself.
 
 ---
 
-## Delayed capture
+## Delayed capture ✅ Completed
 
-Hotkey modifier or tray option for a **3/5-second timer**, for capturing
+Select the area first, then the shot fires after a countdown — for capturing
 dropdown menus and tooltips that close when they lose focus.
 
-- Trigger the normal selection overlay after the countdown.
-- Countdown indicator on screen so you know when the shot fires.
+- **Shipped**: hold **Shift while selecting** to arm it (same muscle memory as
+  Ctrl flipping the editor). The duration comes from Settings → Capture →
+  "Shift+select delay (seconds)" (3/5/10…; 0 = Shift does nothing).
+- On release the overlay turns click-through and counts down (ghost outline
+  + remaining seconds) so you can open the menu or hover the tooltip; the
+  shot fires automatically. Esc cancels. Normal captures stay instant.
 
 ## Multi-file drag from the stack
 
@@ -24,15 +28,20 @@ time.
 - Selection UI: expand the thumbnail stack (or use the history gallery) and
   drag the selected set.
 
-## OCR — copy text from a screenshot
+## OCR — copy text from a screenshot ✅ Completed
 
 Draw a region → the extracted text lands on your clipboard.
 
+- **Shipped**: global hotkey **Ctrl+Shift+5** (configurable in Settings →
+  Capture → "Text Capture Hotkey") captures a region and copies the
+  recognized text to the clipboard — no file saved, no thumbnail.
+  The annotation editor also has an **🔤 OCR** button that recognizes the
+  current capture.
 - Uses the built-in **offline** Windows OCR (`Windows.Media.Ocr`), so it
   stays 100% local-first like the rest of the app — no cloud, no API keys.
-- The single biggest utility add for a capture tool.
-- Natural follow-ups once the base works: OCR search over history, and an
-  "OCR + copy image" combined action.
+- Possible follow-ups: OCR search over history, an "OCR + copy image"
+  combined action, and a language picker for machines with several
+  installed OCR languages.
 
 ## Last-capture hotkeys
 
