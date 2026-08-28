@@ -129,6 +129,10 @@ pub fn hide_all(app: &AppHandle) -> Result<(), String> {
     THUMBNAIL_WANTED_VISIBLE.store(false, Ordering::SeqCst);
     let generation = PRESENTATION_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     crate::debuglog::log(&format!("thumbnail: hide requested generation={generation}"));
+    if NATIVE_THUMBNAIL {
+        crate::native_thumb::hide();
+        return Ok(());
+    }
     if let Some(w) = app.get_webview_window("thumbnail") {
         w.hide().map_err(|e| {
             log::warn!("thumbnail: hide failed: {e}");
@@ -139,6 +143,9 @@ pub fn hide_all(app: &AppHandle) -> Result<(), String> {
 }
 
 pub fn is_visible(app: &AppHandle) -> bool {
+    if NATIVE_THUMBNAIL {
+        return crate::native_thumb::is_visible();
+    }
     app.get_webview_window("thumbnail")
         .and_then(|w| w.is_visible().ok())
         .unwrap_or(false)
@@ -147,6 +154,14 @@ pub fn is_visible(app: &AppHandle) -> bool {
 pub fn set_visible(app: &AppHandle, visible: bool) -> Result<(), String> {
     THUMBNAIL_WANTED_VISIBLE.store(visible, Ordering::SeqCst);
     crate::debuglog::log(&format!("thumbnail: set_visible requested visible={visible}"));
+    if NATIVE_THUMBNAIL {
+        if visible {
+            crate::native_thumb::show();
+        } else {
+            crate::native_thumb::hide();
+        }
+        return Ok(());
+    }
     if let Some(w) = app.get_webview_window("thumbnail") {
         let result = if visible { w.show() } else { w.hide() };
         result.map_err(|e| {
@@ -156,6 +171,12 @@ pub fn set_visible(app: &AppHandle, visible: bool) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Experiment: render the thumbnail with a native Win32 window instead of the
+/// WebView2 renderer (branch `fix/native-thumbnail`). The webview window still
+/// exists in the config but is never shown, and the whole watchdog/recovery
+/// stack is bypassed — a native window has no hidden-window suspend bug.
+pub(crate) const NATIVE_THUMBNAIL: bool = true;
 
 const MAX_PRESENT_RETRIES: u8 = 6;
 
@@ -207,24 +228,26 @@ pub fn show_capture(
     // marker so rapid successive captures never reload twice — deliberately
     // NOT by the recovery cooldown: arming it here delayed a click-stall
     // recovery by the full 60s in the field.
-    let last_input = LAST_RENDERER_INPUT.load(Ordering::SeqCst);
-    let idle_ms = now_millis().saturating_sub(last_input);
-    let now_ms = now_millis();
-    if should_refresh_before_present(
-        now_ms,
-        last_input,
-        idle_ms,
-        LAST_REFRESH_AT.load(Ordering::SeqCst),
-        LAST_RECOVERY_AT.load(Ordering::SeqCst),
-    ) {
-        LAST_REFRESH_AT.store(now_ms, Ordering::SeqCst);
-        crate::debuglog::log(&format!(
-            "thumbnail: refreshing renderer after {idle_ms}ms idle before presenting id={}",
-            payload.capture_id
-        ));
-        if let Some(w) = app.get_webview_window("thumbnail") {
-            if let Err(e) = w.reload() {
-                log::warn!("thumbnail: refresh-before-present reload failed: {e}");
+    if !NATIVE_THUMBNAIL {
+        let last_input = LAST_RENDERER_INPUT.load(Ordering::SeqCst);
+        let idle_ms = now_millis().saturating_sub(last_input);
+        let now_ms = now_millis();
+        if should_refresh_before_present(
+            now_ms,
+            last_input,
+            idle_ms,
+            LAST_REFRESH_AT.load(Ordering::SeqCst),
+            LAST_RECOVERY_AT.load(Ordering::SeqCst),
+        ) {
+            LAST_REFRESH_AT.store(now_ms, Ordering::SeqCst);
+            crate::debuglog::log(&format!(
+                "thumbnail: refreshing renderer after {idle_ms}ms idle before presenting id={}",
+                payload.capture_id
+            ));
+            if let Some(w) = app.get_webview_window("thumbnail") {
+                if let Err(e) = w.reload() {
+                    log::warn!("thumbnail: refresh-before-present reload failed: {e}");
+                }
             }
         }
     }
@@ -255,6 +278,44 @@ fn present_capture(
     }
 
     let (size, position) = thumbnail_geometry(&settings, img_w, img_h, sel_center);
+
+    if NATIVE_THUMBNAIL {
+        use base64::Engine as _;
+        // Native window path: no WebView ops, no retry ladder, no reload. The
+        // event is still emitted so Settings history stays in sync.
+        if let Err(e) = app.emit("thumbnail-captured", payload.clone()) {
+            log::warn!("thumbnail: captured event failed: {e}");
+        }
+        let png = payload
+            .preview
+            .strip_prefix("data:image/png;base64,")
+            .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+            .unwrap_or_default();
+        let secs = settings.thumbnail_duration_secs as u64;
+        let auto_hide_ms = if secs > 0 { secs * 1000 } else { 0 };
+        crate::debuglog::log(&format!(
+            "thumbnail: present(native) id={} size={}x{} pos={:?} png_bytes={}",
+            payload.capture_id,
+            size.width,
+            size.height,
+            position,
+            png.len()
+        ));
+        crate::native_thumb::present(
+            app,
+            crate::native_thumb::PresentEntry {
+                capture_id: payload.capture_id,
+                path: payload.path.clone(),
+                png,
+                unsaved: payload.unsaved,
+            },
+            size,
+            position,
+            auto_hide_ms,
+        );
+        return;
+    }
+
     let mut should_retry = false;
 
     let mut op_results = Vec::new();
@@ -350,7 +411,7 @@ fn present_capture(
 /// Recalculate the monitor geometry on every retry. If no monitor is available
 /// momentarily, still show the window at a virtual-screen fallback position;
 /// a missing position must never suppress the thumbnail entirely.
-fn thumbnail_geometry(
+pub(crate) fn thumbnail_geometry(
     settings: &settings::Settings,
     img_w: u32,
     img_h: u32,
@@ -693,6 +754,9 @@ fn recover_now(app: &AppHandle, now: u64, heartbeat: u64, last_input: u64, reaso
 /// capture id and reconciles from `LATEST_CAPTURE`); a genuinely frozen
 /// renderer is handled by the heartbeat watchdog instead.
 pub fn recover_after_resume(app: &AppHandle) {
+    if NATIVE_THUMBNAIL {
+        return; // native windows survive sleep; there is no renderer to revive
+    }
     recover_if_stale(app);
 }
 
@@ -704,6 +768,9 @@ pub fn recover_after_resume(app: &AppHandle) {
 /// thumbnail with Esc, which they do ~6s after a failed drag, so the tick
 /// cannot be coarse.
 pub fn spawn_renderer_watchdog(app: AppHandle) {
+    if NATIVE_THUMBNAIL {
+        return; // no webview renderer to babysit
+    }
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
         // Don't wake the event loop unless the thumbnail is meant to be

@@ -10,6 +10,7 @@ mod filename;
 mod history;
 mod hotkey;
 mod monitors;
+mod native_thumb;
 mod notifier;
 mod overlay;
 mod settings;
