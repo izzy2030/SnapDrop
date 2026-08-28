@@ -138,12 +138,19 @@ export default function SettingsApp() {
   const [version, setVersion] = useState<string>("");
   const [showMoreMenu, setShowMoreMenu] = useState(false);
   const [debugLog, setDebugLog] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
   const moreMenuRef = useRef<HTMLDivElement>(null);
   // Capture files are immutable — a path's preview only needs to be fetched
   // once per session. Re-fetching all of them on every refresh/focus made the
   // main window stall at grab time (the "focus" event fires exactly when the
   // user presses the title bar to drag it).
   const fetchedPreviews = useRef<Set<string>>(new Set());
+  const selectionAnchor = useRef<number | null>(null);
+
+  const clearSelection = useCallback(() => {
+    setSelected(new Set());
+    selectionAnchor.current = null;
+  }, []);
 
   useEffect(() => {
     const handleOutsideClick = (e: MouseEvent) => {
@@ -159,12 +166,40 @@ export default function SettingsApp() {
     };
   }, [showMoreMenu]);
 
+  // Esc is a GLOBAL hotkey in Rust (dismisses overlay/thumbnail/editor) that
+  // consumes the key — the webview never sees the keydown itself. Rust
+  // re-emits it as "esc-pressed"; the keydown listener below is only a
+  // fallback for running the UI in a plain browser.
+  useEffect(() => {
+    const onEsc = () => {
+      setShowMoreMenu(false);
+      clearSelection();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onEsc();
+    };
+    document.addEventListener("keydown", onKey);
+    const unlisten = listen("esc-pressed", onEsc);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      unlisten.then((f) => f());
+    };
+  }, [clearSelection]);
+
   const refreshHistory = useCallback(() => {
     setRefreshing(true);
     api
       .getHistory()
       .then((h) => {
         setHistory(h);
+        // Drop selections for entries that no longer exist (e.g. files
+        // deleted outside the app).
+        setSelected((prev) => {
+          if (prev.size === 0) return prev;
+          const live = new Set(h.map((e) => e.path));
+          const next = new Set([...prev].filter((p) => live.has(p)));
+          return next.size === prev.size ? prev : next;
+        });
         // Drop previews for entries that no longer exist (e.g. files deleted
         // outside the app), and fetch previews for visible entries.
         setPreviews((prev) => {
@@ -245,15 +280,6 @@ export default function SettingsApp() {
     }
   };
 
-  const handleDragStart = (e: React.MouseEvent, path: string) => {
-    // Only trigger on direct left click hold/drag
-    if (e.button !== 0) return;
-    api.startDrag(path).then((outcome) => {
-      if (outcome.moved) {
-        refreshHistory();
-      }
-    }).catch(console.error);
-  };
 
   const filteredHistory = useMemo(() => {
     return history.filter((item) => {
@@ -276,6 +302,61 @@ export default function SettingsApp() {
     });
     return { today, earlier };
   }, [filteredHistory]);
+
+  const pathIndex = useMemo(() => {
+    const m = new Map<string, number>();
+    filteredHistory.forEach((h, i) => m.set(h.path, i));
+    return m;
+  }, [filteredHistory]);
+
+  const toggleSelect = (e: React.MouseEvent, item: HistoryEntry, idx: number) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.shiftKey && selectionAnchor.current !== null) {
+      const lo = Math.min(selectionAnchor.current, idx);
+      const hi = Math.max(selectionAnchor.current, idx);
+      setSelected((prev) => {
+        const next = new Set(prev);
+        for (let i = lo; i <= hi; i++) {
+          const p = filteredHistory[i]?.path;
+          if (p) next.add(p);
+        }
+        return next;
+      });
+    } else {
+      setSelected((prev) => {
+        const next = new Set(prev);
+        if (next.has(item.path)) next.delete(item.path);
+        else next.add(item.path);
+        return next;
+      });
+      selectionAnchor.current = idx;
+    }
+  };
+
+  const handleRowMouseDown = (e: React.MouseEvent, item: HistoryEntry) => {
+    if (e.button !== 0) return;
+    // Ctrl/Shift+press selects instead of dragging.
+    if (e.ctrlKey || e.shiftKey) {
+      const idx = pathIndex.get(item.path) ?? -1;
+      toggleSelect(e, item, idx);
+      return;
+    }
+    // Pressing a row that is part of a multi-selection drags the whole set;
+    // any other row drags just that file (and clears the selection).
+    const multi = selected.size > 1 && selected.has(item.path);
+    const dragging = multi ? Array.from(selected) : [item.path];
+    if (!multi) clearSelection();
+    api
+      .startDrag(dragging)
+      .then((outcome) => {
+        if (outcome.moved) {
+          clearSelection();
+          refreshHistory();
+        }
+      })
+      .catch(console.error);
+  };
 
   if (!settings) {
     return (
@@ -520,7 +601,38 @@ export default function SettingsApp() {
             </header>
 
             {/* Canvas Body */}
-            <div className="canvas-body">
+            <div
+              className="canvas-body"
+              onMouseDown={(e) => {
+                // Deselect when clicking any non-interactive part of the
+                // canvas: gaps between rows, the timeline headers/lines, or
+                // empty space below the list. Rows, cards and the selection
+                // bar keep their own behavior.
+                const t = e.target as HTMLElement;
+                if (!t.closest(".screenshot-row, .screenshot-card, .selection-bar")) {
+                  clearSelection();
+                }
+              }}
+            >
+              {selected.size > 0 && (
+                <div className="selection-bar">
+                  <span className="selection-count">{selected.size} selected</span>
+                  <span className="selection-hint">
+                    Drag any selected capture to share them all at once
+                  </span>
+                  <button
+                    type="button"
+                    className="btn-icon"
+                    onClick={clearSelection}
+                    title="Clear selection (Esc)"
+                  >
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                      <line x1="18" y1="6" x2="6" y2="18" />
+                      <line x1="6" y1="6" x2="18" y2="18" />
+                    </svg>
+                  </button>
+                </div>
+              )}
               {filteredHistory.length === 0 ? (
                 <div className="empty-state">
                   <svg className="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
@@ -546,11 +658,18 @@ export default function SettingsApp() {
                         {groupedHistory.today.map((item) => (
                           <div
                             key={item.path}
-                            className="screenshot-row"
-                            onMouseDown={(e) => handleDragStart(e, item.path)}
-                            title="Drag to drop into another app, or click actions"
+                            className={`screenshot-row${selected.has(item.path) ? " selected" : ""}`}
+                            onMouseDown={(e) => handleRowMouseDown(e, item)}
+                            title="Drag to drop into another app · Ctrl+click to select multiple"
                           >
                             <div className="screenshot-thumb-box">
+                              {selected.has(item.path) && (
+                                <span className="selection-check">
+                                  <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round">
+                                    <polyline points="20 6 9 17 4 12" />
+                                  </svg>
+                                </span>
+                              )}
                               {previews[item.path] ? (
                                 <img
                                   src={previews[item.path]}
@@ -628,6 +747,11 @@ export default function SettingsApp() {
                                   setPreviews((prev) => {
                                     const next = { ...prev };
                                     delete next[item.path];
+                                    return next;
+                                  });
+                                  setSelected((prev) => {
+                                    const next = new Set(prev);
+                                    next.delete(item.path);
                                     return next;
                                   });
                                 }}
@@ -655,11 +779,18 @@ export default function SettingsApp() {
                         {groupedHistory.earlier.map((item) => (
                           <div
                             key={item.path}
-                            className="screenshot-row"
-                            onMouseDown={(e) => handleDragStart(e, item.path)}
-                            title="Drag to drop into another app, or click actions"
+                            className={`screenshot-row${selected.has(item.path) ? " selected" : ""}`}
+                            onMouseDown={(e) => handleRowMouseDown(e, item)}
+                            title="Drag to drop into another app · Ctrl+click to select multiple"
                           >
                             <div className="screenshot-thumb-box">
+                              {selected.has(item.path) && (
+                                <span className="selection-check">
+                                  <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round">
+                                    <polyline points="20 6 9 17 4 12" />
+                                  </svg>
+                                </span>
+                              )}
                               {previews[item.path] ? (
                                 <img
                                   src={previews[item.path]}
@@ -739,6 +870,11 @@ export default function SettingsApp() {
                                     delete next[item.path];
                                     return next;
                                   });
+                                  setSelected((prev) => {
+                                    const next = new Set(prev);
+                                    next.delete(item.path);
+                                    return next;
+                                  });
                                 }}
                                 title="Delete capture"
                               >
@@ -760,10 +896,18 @@ export default function SettingsApp() {
                   {filteredHistory.map((item) => (
                     <div
                       key={item.path}
-                      className="screenshot-card"
-                      onMouseDown={(e) => handleDragStart(e, item.path)}
+                      className={`screenshot-card${selected.has(item.path) ? " selected" : ""}`}
+                      onMouseDown={(e) => handleRowMouseDown(e, item)}
+                      title="Drag to drop into another app · Ctrl+click to select multiple"
                     >
                       <div className="card-preview-box">
+                        {selected.has(item.path) && (
+                          <span className="selection-check">
+                            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round">
+                              <polyline points="20 6 9 17 4 12" />
+                            </svg>
+                          </span>
+                        )}
                         {previews[item.path] ? (
                           <img
                             src={previews[item.path]}
@@ -773,7 +917,19 @@ export default function SettingsApp() {
                         ) : (
                           <span className="screenshot-thumb-placeholder">PNG Preview</span>
                         )}
-                        <div className="card-overlay" onMouseDown={(e) => e.stopPropagation()}>
+                        <div
+                          className="card-overlay"
+                          onMouseDown={(e) => {
+                            // The overlay covers the whole preview, so only
+                            // presses on the action buttons should be
+                            // swallowed — anything else falls through to the
+                            // card so Ctrl/Shift+click selects and plain
+                            // presses drag.
+                            if ((e.target as HTMLElement).closest("button")) {
+                              e.stopPropagation();
+                            }
+                          }}
+                        >
                           <button
                             type="button"
                             className="card-overlay-btn"

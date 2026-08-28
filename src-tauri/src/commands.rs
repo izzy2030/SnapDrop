@@ -403,16 +403,19 @@ fn open_folder_plain(path: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn start_drag(app: AppHandle, path: String) -> Result<dragdrop::DragOutcome, String> {
+pub fn start_drag(app: AppHandle, paths: Vec<String>) -> Result<dragdrop::DragOutcome, String> {
     // The watchdog compares pointerdown vs drag-start: a healthy page starts a
     // drag moments after the press, a wedged renderer never does.
     thumbnail::note_drag_started();
-    let outcome = dragdrop::start_drag(&app, &path)?;
+    let outcome = dragdrop::start_drag(&app, &paths)?;
     if outcome.moved {
         let s = settings::get(&app);
         if !s.keep_after_drag {
-            let _ = fs::remove_file(&path);
-            history::remove(&app, &path);
+            // Move-drop with "keep file" off deletes every dragged file.
+            for p in &paths {
+                let _ = fs::remove_file(p);
+                history::remove(&app, p);
+            }
             crate::tray::refresh(&app);
         }
     }

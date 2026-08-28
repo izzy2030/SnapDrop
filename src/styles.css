@@ -623,6 +623,7 @@ input[type="checkbox"] {
   justify-content: center;
   flex-shrink: 0;
   border: 1px solid #dbe0eb;
+  position: relative;
 }
 
 .screenshot-thumb-img {
@@ -776,6 +777,60 @@ input[type="checkbox"] {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Multi-select in history */
+.selection-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  background: #eef3fe;
+  border: 1px solid #c9d8f7;
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+.selection-count {
+  font-weight: 600;
+  color: #2b5bd7;
+  flex-shrink: 0;
+}
+
+.selection-hint {
+  flex: 1;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.screenshot-row.selected {
+  border-color: #2b5bd7;
+  background: #eef3fe;
+  box-shadow: 0 0 0 1px #2b5bd7 inset;
+}
+
+.screenshot-card.selected {
+  border-color: #2b5bd7;
+  box-shadow: 0 0 0 1px #2b5bd7;
+}
+
+.selection-check {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #2b5bd7;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  z-index: 2;
 }
 
 .card-meta-row {

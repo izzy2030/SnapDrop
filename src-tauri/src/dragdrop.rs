@@ -75,19 +75,24 @@ pub fn is_drag_active() -> bool {
 /// thread waits, then the actual OLE drag runs inline on the main thread.
 /// DoDragDrop runs its own modal message loop, so the main thread stays
 /// responsive to the OS for the duration of the drag.
-pub fn start_drag(_app: &tauri::AppHandle, path: &str) -> Result<DragOutcome, String> {
+pub fn start_drag(_app: &tauri::AppHandle, paths: &[String]) -> Result<DragOutcome, String> {
     DRAG_ACTIVE.store(true, Ordering::SeqCst);
-    let result = start_drag_inner(path);
+    let result = start_drag_inner(paths);
     DRAG_ACTIVE.store(false, Ordering::SeqCst);
     result
 }
 
-fn start_drag_inner(path: &str) -> Result<DragOutcome, String> {
-    crate::debuglog::log("drag: inner enter");
-    if !Path::new(path).exists() {
+fn start_drag_inner(paths: &[String]) -> Result<DragOutcome, String> {
+    crate::debuglog::log(&format!("drag: inner enter paths={}", paths.len()));
+    // Drop paths that vanished since selection (external deletes).
+    let existing: Vec<String> = paths
+        .iter()
+        .filter(|p| Path::new(p).exists())
+        .cloned()
+        .collect();
+    if existing.is_empty() {
         return Err("File not found".into());
     }
-    let path = path.to_string();
     let (tx, rx) = mpsc::channel();
 
     // Poll globally until the cursor actually moves (real drag) or the button
@@ -110,14 +115,14 @@ fn start_drag_inner(path: &str) -> Result<DragOutcome, String> {
     }
 
     eprintln!("[snapdrop] drag: starting on thread {:?}", std::thread::current().id());
-    Ok(unsafe { run_drag_inline(&path) })
+    Ok(unsafe { run_drag_inline(&existing) })
 }
 
 /// Runs the whole drag on the calling thread — the app's main thread, since
 /// Tauri dispatches commands there. COM is initialized apartment-threaded, the
 /// drag-source window is created on this thread, and the drag image is built
 /// and destroyed here too (GDI objects are thread-affine).
-unsafe fn run_drag_inline(path: &str) -> DragOutcome {
+unsafe fn run_drag_inline(paths: &[String]) -> DragOutcome {
     // The shell drag needs full OLE initialization (OleInitialize wraps
     // CoInitializeEx STA and adds the clipboard/drag services DoDragDrop
     // requires). Plain CoInitializeEx made SHDoDragDrop fail instantly with
@@ -127,7 +132,7 @@ unsafe fn run_drag_inline(path: &str) -> DragOutcome {
     let hwnd = create_drag_source_window();
 
     let data: IDataObject = DropData {
-        path: path.to_string(),
+        paths: paths.to_vec(),
     }
     .into();
     let source: IDropSource = DropSource.into();
@@ -135,7 +140,8 @@ unsafe fn run_drag_inline(path: &str) -> DragOutcome {
     let mut effect: DROPEFFECT = DROPEFFECT::default();
     let ok_effects = DROPEFFECT_COPY | DROPEFFECT_MOVE;
 
-    let drag_image = build_drag_image(path);
+    // The drag image shows the first file's preview; the payload carries all.
+    let drag_image = paths.first().and_then(|p| build_drag_image(p));
     crate::debuglog::log("drag: entering SHDoDragDrop/DoDragDrop modal loop");
 
     let hr = match &drag_image {
@@ -354,13 +360,17 @@ fn build_drag_image(path: &str) -> Option<(HBITMAP, HDC, SIZE, POINT)> {
 
 #[implement(IDataObject)]
 struct DropData {
-    path: String,
+    paths: Vec<String>,
 }
 
-fn build_hdrop_global(path: &str) -> windows::core::Result<HGLOBAL> {
+fn build_hdrop_global(paths: &[String]) -> windows::core::Result<HGLOBAL> {
     unsafe {
-        let mut wide: Vec<u16> = path.encode_utf16().collect();
-        wide.push(0);
+        // CF_HDROP is a double-NUL-terminated list of NUL-terminated paths.
+        let mut wide: Vec<u16> = Vec::new();
+        for p in paths {
+            wide.extend(p.encode_utf16());
+            wide.push(0);
+        }
         wide.push(0);
         let df = DROPFILES {
             pFiles: size_of::<DROPFILES>() as u32,
@@ -392,7 +402,7 @@ impl IDataObject_Impl for DropData_Impl {
         unsafe {
             let fmt = &*pformatetcin;
             if fmt.cfFormat == CF_HDROP.0 && fmt.tymed & TYMED_HGLOBAL.0 as u32 != 0 {
-                let h = build_hdrop_global(&self.this.path)?;
+                let h = build_hdrop_global(&self.this.paths)?;
                 Ok(STGMEDIUM {
                     tymed: TYMED_HGLOBAL.0 as u32,
                     u: STGMEDIUM_0 { hGlobal: h },
@@ -559,5 +569,88 @@ impl IDropSource_Impl for DropSource_Impl {
 
     fn GiveFeedback(&self, _dweffect: DROPEFFECT) -> HRESULT {
         DRAGDROP_S_USEDEFAULTCURSORS
+    }
+}
+
+#[cfg(test)]
+mod dragdrop_tests {
+    use super::*;
+
+    /// The CF_HDROP payload must carry every file: a double-NUL-terminated
+    /// list of NUL-terminated UTF-16 paths, laid out after the DROPFILES
+    /// header, with `fWide` set.
+    #[test]
+    fn hdrop_payload_roundtrips_multiple_paths() {
+        let paths = vec![
+            "C:\\Shots\\one.png".to_string(),
+            "C:\\Shots\\two.png".to_string(),
+            "C:\\Shots\\three.png".to_string(),
+        ];
+        let h = build_hdrop_global(&paths).expect("payload build");
+        unsafe {
+            let ptr = GlobalLock(h);
+            assert!(!ptr.is_null());
+            let df_ptr = ptr.cast::<DROPFILES>();
+            // DROPFILES is packed — read fields by value, never by reference.
+            let fwide = std::ptr::addr_of!((*df_ptr).fWide).read_unaligned();
+            let pfiles = std::ptr::addr_of!((*df_ptr).pFiles).read_unaligned();
+            assert_eq!(fwide.0, 1);
+            assert_eq!(pfiles, size_of::<DROPFILES>() as u32);
+            let list_ptr = (ptr as *const u8).add(size_of::<DROPFILES>()) as *const u16;
+            // Read the whole payload and split on NULs.
+            let total = size_of::<DROPFILES>() + paths.iter().map(|p| p.encode_utf16().count() + 1).sum::<usize>() * 2 + 2;
+            let words = std::slice::from_raw_parts(list_ptr, (total - size_of::<DROPFILES>()) / 2);
+            let mut out: Vec<String> = Vec::new();
+            let mut cur: Vec<u16> = Vec::new();
+            for &w in words {
+                if w == 0 {
+                    if !cur.is_empty() {
+                        out.push(String::from_utf16(&cur).expect("utf16"));
+                        cur.clear();
+                    }
+                } else {
+                    cur.push(w);
+                }
+            }
+            assert_eq!(out, paths);
+            // The trailing double-NUL must exist: after the last path's NUL,
+            // the very next word is the terminator.
+            assert_eq!(words.last(), Some(&0));
+            let _ = GlobalUnlock(h);
+            let _ = windows::Win32::Foundation::GlobalFree(Some(h));
+        }
+    }
+
+    /// Single-file payloads (the floating-thumbnail path) must stay intact.
+    #[test]
+    fn hdrop_payload_single_path() {
+        let paths = vec!["C:\\Shots\\one.png".to_string()];
+        let h = build_hdrop_global(&paths).expect("payload build");
+        unsafe {
+            let ptr = GlobalLock(h);
+            assert!(!ptr.is_null());
+            let df_ptr = ptr.cast::<DROPFILES>();
+            let fwide = std::ptr::addr_of!((*df_ptr).fWide).read_unaligned();
+            assert_eq!(fwide.0, 1);
+            let list_ptr = (ptr as *const u8).add(size_of::<DROPFILES>()) as *const u16;
+            let total = size_of::<DROPFILES>() + paths.iter().map(|p| p.encode_utf16().count() + 1).sum::<usize>() * 2 + 2;
+            let words = std::slice::from_raw_parts(list_ptr, (total - size_of::<DROPFILES>()) / 2);
+            let mut out: Vec<String> = Vec::new();
+            let mut cur: Vec<u16> = Vec::new();
+            for &w in words {
+                if w == 0 {
+                    if !cur.is_empty() {
+                        out.push(String::from_utf16(&cur).expect("utf16"));
+                        cur.clear();
+                    }
+                } else {
+                    cur.push(w);
+                }
+            }
+            assert_eq!(out, paths);
+            assert_eq!(words.last(), Some(&0));
+            let _ = GlobalUnlock(h);
+            let _ = windows::Win32::Foundation::GlobalFree(Some(h));
+        }
     }
 }

@@ -247,6 +247,10 @@ pub fn register_esc_hotkey(app: &AppHandle) {
             } else if crate::thumbnail::is_visible(app) {
                 let _ = crate::thumbnail::hide_all(app);
             }
+            // The main window's webview never sees Esc (the global hotkey
+            // consumes it), so re-route it there — the gallery uses it to
+            // clear history multi-selection.
+            let _ = app.emit("esc-pressed", ());
         }));
     }) {
         Ok(()) => log::info!("esc hotkey registered (dismiss)"),

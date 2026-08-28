@@ -523,7 +523,7 @@ unsafe fn on_button_down(hwnd: HWND, lparam: LPARAM) {
     // release and hangs forever (observed with the Tauri main thread). It pumps
     // this thread's messages while it runs, so the window keeps painting; this
     // handler just doesn't return until the drag ends.
-    let outcome = crate::commands::start_drag(app.clone(), path.clone());
+    let outcome = crate::commands::start_drag(app.clone(), vec![path.clone()]);
     if let Err(e) = &outcome {
         crate::debuglog::log(&format!("native_thumb: drag ERROR {e}"));
     }

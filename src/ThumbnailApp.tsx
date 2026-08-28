@@ -151,7 +151,7 @@ export default function ThumbnailApp() {
     if (!path) return;
     api.debugLog(`drag start path=${path}`).catch(() => {});
     api
-      .startDrag(path)
+      .startDrag([path])
       .then((outcome) => {
         api.debugLog(`drag done path=${path} dropped=${outcome.dropped} moved=${outcome.moved}`).catch(() => {});
         if (outcome.moved) {
