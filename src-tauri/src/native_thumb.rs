@@ -41,12 +41,14 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_SHIFT,
-};
-use windows::Win32::UI::WindowsAndMessaging::{
+};use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, IsWindowVisible,
-    PostMessageW, PostQuitMessage, RegisterClassExW, SetWindowPos, ShowWindow, TranslateMessage,
-    CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, HWND_TOPMOST, MA_NOACTIVATE, MSG, SWP_NOACTIVATE,    SWP_NOMOVE, SWP_SHOWWINDOW, SW_HIDE, WM_APP, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_PAINT, WNDCLASSEXW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SetWindowPos,
+    ShowWindow, TranslateMessage, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, IDC_ARROW,
+    HWND_TOPMOST, MA_NOACTIVATE, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_SHOWWINDOW,
+    SW_HIDE, WM_APP, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_PAINT, WNDCLASSEXW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const WM_APP_CMD: u32 = WM_APP + 1;
@@ -248,12 +250,14 @@ fn ensure_window() -> isize {
 
 unsafe fn create_window() -> HWND {
     let hinst = HINSTANCE(GetModuleHandleW(PCWSTR::null()).unwrap_or_default().0);
+    let cursor = LoadCursorW(None, IDC_ARROW).ok();
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
         lpfnWndProc: Some(thumb_wndproc),
         hInstance: hinst,
         lpszClassName: CLASS_NAME,
+        hCursor: cursor.unwrap_or_default(),
         ..Default::default()
     };
     RegisterClassExW(&wc);
