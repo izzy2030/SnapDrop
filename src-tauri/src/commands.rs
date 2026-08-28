@@ -362,6 +362,9 @@ fn open_folder_plain(path: &str) -> Result<(), String> {
 
 #[tauri::command]
 pub fn start_drag(app: AppHandle, path: String) -> Result<dragdrop::DragOutcome, String> {
+    // The watchdog compares pointerdown vs drag-start: a healthy page starts a
+    // drag moments after the press, a wedged renderer never does.
+    thumbnail::note_drag_started();
     let outcome = dragdrop::start_drag(&app, &path)?;
     if outcome.moved {
         let s = settings::get(&app);
@@ -451,6 +454,21 @@ pub fn get_latest_capture() -> Option<thumbnail::CapturedPayload> {
 #[tauri::command]
 pub fn debug_log(msg: String) {
     crate::debuglog::log(&format!("renderer: {msg}"));
+}
+
+/// Throttled input-liveness signal from the thumbnail renderer. Feeds the
+/// watchdog's "ghost" detection (JS alive but input pipeline stuck).
+#[tauri::command]
+pub fn report_renderer_input() {
+    thumbnail::report_renderer_input();
+}
+
+/// Immediate (unthrottled) `pointerdown` signal from the thumbnail renderer.
+/// Lets the watchdog distinguish a plain hover from a click that never became
+/// a drag — the exact ghost signature.
+#[tauri::command]
+pub fn report_renderer_pointerdown() {
+    thumbnail::report_renderer_pointerdown();
 }
 
 #[tauri::command]

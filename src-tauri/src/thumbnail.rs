@@ -36,11 +36,43 @@ static PRESENTATION_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// stale timestamp means the WebView is frozen or wedged (e.g. after display
 /// sleep) and the thumbnail is a non-interactive ghost.
 static LAST_RENDERER_HEARTBEAT: AtomicU64 = AtomicU64::new(0);
+/// Milliseconds of the last input event (pointer/keyboard/wheel) the thumbnail
+/// renderer received. The renderer reports these (throttled) via
+/// `report_renderer_input`; a fresh heartbeat with a stale input timestamp
+/// while the window is on screen means JS is running but the WebView's input
+/// pipeline/compositor is stuck — the "ghost" that looks visible but ignores
+/// drags. This is invisible to the heartbeat-only watchdog.
+static LAST_RENDERER_INPUT: AtomicU64 = AtomicU64::new(0);
+/// Milliseconds of the last `pointerdown` the thumbnail renderer received.
+/// Reported immediately (unthrottled) via `report_renderer_pointerdown`.
+/// Unlike the generic input timestamp, this one distinguishes "moves reached
+/// the page" from "a click was received". A click that never produces a drag
+/// is the exact ghost signature: the page saw the press but its React event
+/// handling is wedged, so the user can look at it, wiggle the mouse, and drag
+/// nothing.
+static LAST_RENDERER_POINTERDOWN: AtomicU64 = AtomicU64::new(0);
+/// Milliseconds of the last time the renderer successfully started a native
+/// drag (`start_drag` command). Compared against `LAST_RENDERER_POINTERDOWN`
+/// by the click-stall watchdog: a healthy page starts a drag within moments of
+/// the press; a ghost never does.
+static LAST_DRAG_STARTED_AT: AtomicU64 = AtomicU64::new(0);
+/// Whether the renderer received any input since the last forced recovery.
+/// Cleared by every recovery and set by `report_renderer_input`/
+/// `report_renderer_pointerdown`. The input-stall rule requires it so an
+/// untouched visible thumbnail is recovered at most once per "episode" —
+/// without it, a thumbnail the user walked away from would be reloaded every
+/// minute forever.
+static INPUT_SINCE_RECOVERY: AtomicBool = AtomicBool::new(true);
 /// Milliseconds of the last presentation attempt (successful or retried).
 static LAST_PRESENT_AT: AtomicU64 = AtomicU64::new(0);
 /// Milliseconds of the last forced renderer recovery. Throttles the watchdog
 /// so a wedged WebView cannot trigger a reload loop.
 static LAST_RECOVERY_AT: AtomicU64 = AtomicU64::new(0);
+/// Milliseconds of the last proactive refresh-before-present. Tracked
+/// separately from `LAST_RECOVERY_AT`: arming the watchdog cooldown here made
+/// a click-stall recovery wait out the full 60s cooldown in the field,
+/// leaving the ghost undraggable ~17s longer than the 2.5s policy intends.
+static LAST_REFRESH_AT: AtomicU64 = AtomicU64::new(0);
 /// Serializes WebView recovery so overlapping watchdog/resume callbacks cannot
 /// reload and present the same window concurrently.
 static RECOVERY_IN_PROGRESS: OnceLock<Mutex<()>> = OnceLock::new();
@@ -60,12 +92,37 @@ pub fn get_latest_capture() -> Option<CapturedPayload> {
     LAST_RENDERER_HEARTBEAT.store(now, Ordering::SeqCst);
     let payload = LATEST_CAPTURE.lock().unwrap().clone();
     crate::debuglog::log(&format!(
-        "thumbnail: IPC get_latest_capture heartbeat={} payload_id={} preview_len={}",
+        "thumbnail: IPC get_latest_capture heartbeat={} payload_id={} preview_len={} input_age_s={} click_age_s={}",
         now,
         payload.as_ref().map(|p| p.capture_id).unwrap_or(0),
-        payload.as_ref().map(|p| p.preview.len()).unwrap_or(0)
+        payload.as_ref().map(|p| p.preview.len()).unwrap_or(0),
+        now.saturating_sub(LAST_RENDERER_INPUT.load(Ordering::SeqCst)) / 1000,
+        now.saturating_sub(LAST_RENDERER_POINTERDOWN.load(Ordering::SeqCst)) / 1000
     ));
     payload
+}
+
+/// Record that the thumbnail renderer received a user input event. Called
+/// (throttled by the renderer) on pointer/keyboard/wheel activity so the
+/// watchdog can distinguish a healthy page from a "ghost" whose JS keeps
+/// running but whose input pipeline is stuck.
+pub fn report_renderer_input() {
+    LAST_RENDERER_INPUT.store(now_millis(), Ordering::SeqCst);
+    INPUT_SINCE_RECOVERY.store(true, Ordering::SeqCst);
+}
+
+/// Record that the thumbnail renderer received a `pointerdown`. Reported
+/// immediately (not throttled) so the watchdog can tell a plain hover from a
+/// click that was never turned into a drag.
+pub fn report_renderer_pointerdown() {
+    LAST_RENDERER_POINTERDOWN.store(now_millis(), Ordering::SeqCst);
+    INPUT_SINCE_RECOVERY.store(true, Ordering::SeqCst);
+}
+
+/// Record that a native drag was started (`start_drag` command). Feeds the
+/// click-stall watchdog: press → drag should follow within moments.
+pub fn note_drag_started() {
+    LAST_DRAG_STARTED_AT.store(now_millis(), Ordering::SeqCst);
 }
 
 pub fn hide_all(app: &AppHandle) -> Result<(), String> {
@@ -142,6 +199,35 @@ pub fn show_capture(
     *LAST_CAPTURE_CENTER.lock().unwrap() = Some(sel_center);
     THUMBNAIL_WANTED_VISIBLE.store(true, Ordering::SeqCst);
     let generation = PRESENTATION_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+
+    // Long-idle ghost prevention: the renderer that sat hidden for minutes (or
+    // overnight) is the one whose frame goes stale and whose drags die. If it
+    // has received no input for a while, reload it before showing the new
+    // capture so the capture lands on a fresh page. Throttled by its own
+    // marker so rapid successive captures never reload twice — deliberately
+    // NOT by the recovery cooldown: arming it here delayed a click-stall
+    // recovery by the full 60s in the field.
+    let last_input = LAST_RENDERER_INPUT.load(Ordering::SeqCst);
+    let idle_ms = now_millis().saturating_sub(last_input);
+    let now_ms = now_millis();
+    if should_refresh_before_present(
+        now_ms,
+        last_input,
+        idle_ms,
+        LAST_REFRESH_AT.load(Ordering::SeqCst),
+        LAST_RECOVERY_AT.load(Ordering::SeqCst),
+    ) {
+        LAST_REFRESH_AT.store(now_ms, Ordering::SeqCst);
+        crate::debuglog::log(&format!(
+            "thumbnail: refreshing renderer after {idle_ms}ms idle before presenting id={}",
+            payload.capture_id
+        ));
+        if let Some(w) = app.get_webview_window("thumbnail") {
+            if let Err(e) = w.reload() {
+                log::warn!("thumbnail: refresh-before-present reload failed: {e}");
+            }
+        }
+    }
 
     present_capture(app, payload, img_w, img_h, sel_center, generation, 0);
 }
@@ -362,17 +448,135 @@ fn schedule_present_retry(
 /// loop.
 const RENDERER_STALE_AFTER_MS: u64 = 10_000;
 const RECOVERY_COOLDOWN_MS: u64 = 60_000;
+/// How long the thumbnail can sit on screen without a single input event
+/// before the watchdog treats it as a "ghost": the renderer's JS is alive
+/// (fresh heartbeat) but the WebView's input/compositor pipeline is stuck, so
+/// the visible frame is stale and drags do nothing. A user who stares at the
+/// thumbnail without touching it is an innocent false positive — the reload
+/// re-presents the same capture invisibly.
+const INPUT_STALL_MS: u64 = 45_000;
+/// How long to wait after a `pointerdown` before declaring the click stalled.
+/// A healthy page starts the native drag within moments of the press (the
+/// renderer initiates it synchronously in `onPointerDown`), so a click that
+/// produced no drag after this grace is a wedged renderer. Kept short (2.5s)
+/// so recovery beats the user dismissing the broken thumbnail with Esc
+/// (observed: users press Esc ~6s after a failed drag attempt).
+const CLICK_STALL_GRACE_MS: u64 = 2_500;
+/// A click older than this no longer counts as "the user just tried to drag"
+/// (avoids firing long after the fact once the cooldown expires).
+const CLICK_STALL_WINDOW_MS: u64 = 30_000;
+/// After this much renderer input-idle, a new capture is presented to a fresh
+/// page: the long-idle ghost (stale frame + dead drags) forms while the page
+/// sits hidden for minutes, so the first capture afterwards gets reloaded
+/// before it is shown.
+const LONG_IDLE_RELOAD_MS: u64 = 60_000;
 
-/// Decide whether the thumbnail renderer needs a forced recovery. Pure so the
-/// watchdog and resume hook share one throttled policy and it is testable:
-/// the renderer heartbeat (`get_latest_capture` poll) stopped, we didn't just
-/// present, and we haven't recovered in the cooldown window.
+/// Decide whether the thumbnail renderer needs a forced recovery because its
+/// JS heartbeat (`get_latest_capture` poll) stopped. Pure so the watchdog and
+/// resume hook share one throttled policy and it is testable: the heartbeat
+/// stopped, we didn't just present, and we haven't recovered in the cooldown.
 fn should_recover(now: u64, heartbeat: u64, last_present: u64, last_recovery: u64) -> bool {
     if now.saturating_sub(heartbeat) < RENDERER_STALE_AFTER_MS {
         return false; // renderer is alive and polling
     }
     if now.saturating_sub(last_present) < RENDERER_STALE_AFTER_MS {
         return false; // just presented (capture flow mid-presentation)
+    }
+    if now.saturating_sub(last_recovery) < RECOVERY_COOLDOWN_MS {
+        return false; // at most one forced recovery per minute
+    }
+    true
+}
+
+/// Decide whether the thumbnail needs recovery because a `pointerdown` was
+/// received but no drag ever started: the page saw the click (so the WebView
+/// is alive and IPC works) but its event handling is wedged, leaving a
+/// visible-but-undraggable ghost. Pure and testable.
+fn should_recover_click_stall(
+    now: u64,
+    heartbeat: u64,
+    last_pointerdown: u64,
+    last_drag: u64,
+    last_present: u64,
+    last_recovery: u64,
+) -> bool {
+    if now.saturating_sub(heartbeat) >= RENDERER_STALE_AFTER_MS {
+        return false; // renderer dead — the heartbeat path handles this
+    }
+    if last_pointerdown == 0 {
+        return false; // no click ever reached the page
+    }
+    if now.saturating_sub(last_pointerdown) < CLICK_STALL_GRACE_MS {
+        return false; // give the healthy page a moment to start the drag
+    }
+    if now.saturating_sub(last_pointerdown) > CLICK_STALL_WINDOW_MS {
+        return false; // stale click; don't recover on ancient history
+    }
+    if last_drag >= last_pointerdown {
+        return false; // a drag started after the press — healthy
+    }
+    if now.saturating_sub(last_present) < CLICK_STALL_GRACE_MS {
+        return false; // just presented; let the user reach for it
+    }
+    if now.saturating_sub(last_recovery) < RECOVERY_COOLDOWN_MS {
+        return false; // at most one forced recovery per minute
+    }
+    true
+}
+
+/// Decide whether to proactively reload the renderer before presenting a
+/// capture that arrives after a long idle. Tracked with its own throttle
+/// marker (not the recovery cooldown) so it can never delay a watchdog
+/// recovery; a page that was just force-recovered is already fresh, so a
+/// recent recovery still skips the refresh. Pure and testable.
+fn should_refresh_before_present(
+    now: u64,
+    last_input: u64,
+    idle_ms: u64,
+    last_refresh: u64,
+    last_recovery: u64,
+) -> bool {
+    if last_input == 0 {
+        return false; // brand-new page that never reported input — nothing to refresh
+    }
+    if idle_ms <= LONG_IDLE_RELOAD_MS {
+        return false; // recent input — the page is warm
+    }
+    if now.saturating_sub(last_refresh) < RECOVERY_COOLDOWN_MS {
+        return false; // rapid successive captures: at most one refresh per cooldown
+    }
+    if now.saturating_sub(last_recovery) < RECOVERY_COOLDOWN_MS {
+        return false; // just force-recovered — the page is already fresh
+    }
+    true
+}
+
+/// Decide whether the thumbnail needs recovery because the renderer is *alive*
+/// (fresh heartbeat) but has received no input for a long time: the JS keeps
+/// running (IPC + timers work, heartbeat stays fresh) while the visible frame
+/// and input delivery are stuck after a long idle/sleep. Pure and testable.
+/// `input_since_recovery` is required so an untouched visible thumbnail is
+/// recovered at most once per episode: if the reload didn't restore input and
+/// the user isn't interacting, reloading every minute accomplishes nothing.
+fn should_recover_input_stall(
+    now: u64,
+    heartbeat: u64,
+    last_input: u64,
+    last_present: u64,
+    last_recovery: u64,
+    input_since_recovery: bool,
+) -> bool {
+    if now.saturating_sub(heartbeat) >= RENDERER_STALE_AFTER_MS {
+        return false; // renderer dead — the heartbeat path handles this
+    }
+    if !input_since_recovery {
+        return false; // no interaction since the last recovery — don't churn
+    }
+    if now.saturating_sub(last_input) < INPUT_STALL_MS {
+        return false; // user recently interacted (or is actively dragging)
+    }
+    if now.saturating_sub(last_present) < INPUT_STALL_MS {
+        return false; // just presented; give the user a moment to interact
     }
     if now.saturating_sub(last_recovery) < RECOVERY_COOLDOWN_MS {
         return false; // at most one forced recovery per minute
@@ -393,11 +597,52 @@ pub fn recover_if_stale(app: &AppHandle) {
     }
     let now = now_millis();
     let heartbeat = LAST_RENDERER_HEARTBEAT.load(Ordering::SeqCst);
+    let last_input = LAST_RENDERER_INPUT.load(Ordering::SeqCst);
     let last_present = LAST_PRESENT_AT.load(Ordering::SeqCst);
     let last_recovery = LAST_RECOVERY_AT.load(Ordering::SeqCst);
-    if !should_recover(now, heartbeat, last_present, last_recovery) {
-        return;
+
+    // Path 1: the renderer's JS heartbeat stopped (dead/frozen WebView).
+    if should_recover(now, heartbeat, last_present, last_recovery) {
+        return recover_now(app, now, heartbeat, last_input, "stale heartbeat");
     }
+    // Path 2: JS is alive but the page stopped receiving input while the
+    // window is on screen — a compositor/input ghost after long idle (visible
+    // but stale, drags do nothing). Skipped during an active drag (the OLE
+    // drag loop owns the pointer, so the webview legitimately sees no events).
+    if should_recover_input_stall(
+        now,
+        heartbeat,
+        last_input,
+        last_present,
+        last_recovery,
+        INPUT_SINCE_RECOVERY.load(Ordering::SeqCst),
+    ) && is_visible(app)
+        && !crate::dragdrop::is_drag_active()
+    {
+        return recover_now(app, now, heartbeat, last_input, "input-stalled");
+    }
+    // Path 3: a pointerdown reached the page but no drag ever started — the
+    // user pressed the thumbnail and nothing happened. Distinct from path 2
+    // (which needs 45s of *no* input): here input (moves) may be flowing fine,
+    // it is specifically the click→drag processing that is wedged.
+    if should_recover_click_stall(
+        now,
+        heartbeat,
+        LAST_RENDERER_POINTERDOWN.load(Ordering::SeqCst),
+        LAST_DRAG_STARTED_AT.load(Ordering::SeqCst),
+        last_present,
+        last_recovery,
+    ) && is_visible(app)
+        && !crate::dragdrop::is_drag_active()
+    {
+        return recover_now(app, now, heartbeat, last_input, "click-stalled");
+    }
+}
+
+/// Reload the thumbnail WebView and re-present the latest capture. Shared by
+/// the heartbeat and input-stall recovery paths; rechecks that the thumbnail
+/// is still wanted before acting so a dismissal can't be resurrected.
+fn recover_now(app: &AppHandle, now: u64, heartbeat: u64, last_input: u64, reason: &str) {
     // Read the payload directly (not via `get_latest_capture`) so this recovery
     // does not bump the renderer heartbeat and mask a still-dead WebView.
     let Some(payload) = LATEST_CAPTURE.lock().unwrap().clone() else {
@@ -415,15 +660,21 @@ pub fn recover_if_stale(app: &AppHandle) {
     }
 
     LAST_RECOVERY_AT.store(now, Ordering::SeqCst);
+    // A recovery is a fresh start: restart the input-stall clock and require
+    // the user to interact before an input-stall recovery can fire again, so
+    // an untouched thumbnail is never reloaded in a loop.
+    LAST_RENDERER_INPUT.store(now, Ordering::SeqCst);
+    INPUT_SINCE_RECOVERY.store(false, Ordering::SeqCst);
     crate::debuglog::log(&format!(
-        "thumbnail: RECOVER stale heartbeat ({}s) -> reload + present id={}",
+        "thumbnail: RECOVER {reason} ({}s since heartbeat, {}s since input) -> reload + present id={}",
         (now - heartbeat) / 1000,
+        (now - last_input) / 1000,
         payload.capture_id
     ));
-    log::warn!("thumbnail: renderer heartbeat stale ({}s); reloading and re-presenting", (now - heartbeat) / 1000);
+    log::warn!("thumbnail: renderer {reason} ({}s); reloading and re-presenting", (now - heartbeat) / 1000);
     if let Some(w) = app.get_webview_window("thumbnail") {
         if let Err(e) = w.reload() {
-            log::warn!("thumbnail: reload after stale heartbeat failed: {e}");
+            log::warn!("thumbnail: reload after {reason} failed: {e}");
         }
     }
     present_capture(
@@ -448,10 +699,13 @@ pub fn recover_after_resume(app: &AppHandle) {
 /// Background watchdog: while the thumbnail is meant to be visible, check that
 /// the renderer is still polling. A WebView that froze across display sleep
 /// stops answering IPC and would otherwise remain a stale, non-draggable ghost
-/// until the app restarts. Runs every few seconds on a dedicated thread.
+/// until the app restarts. Runs every second on a dedicated thread — the
+/// click-stall rule (2.5s grace) must beat the user dismissing a broken
+/// thumbnail with Esc, which they do ~6s after a failed drag, so the tick
+/// cannot be coarse.
 pub fn spawn_renderer_watchdog(app: AppHandle) {
     std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(4));
+        std::thread::sleep(std::time::Duration::from_secs(1));
         // Don't wake the event loop unless the thumbnail is meant to be
         // visible; when hidden (dismissed, auto-hide, or between captures)
         // there is nothing to recover.
@@ -536,6 +790,76 @@ mod tests {
         assert!(should_recover(now, 0, now - 60_000, now - 120_000));
         // Recovery just happened → must wait out the cooldown again.
         assert!(!should_recover(now, 0, now - 60_000, now - 1_000));
+    }
+
+    #[test]
+    fn input_stall_recovery_fires_only_for_live_renderer_with_no_input() {
+        let now = 1_000_000u64;
+        // Dead renderer → handled by the heartbeat path, never input-stall.
+        assert!(!should_recover_input_stall(now, 0, now - 60_000, now - 120_000, 0, true));
+        // Fresh input → user is interacting (or dragging), no recovery.
+        assert!(!should_recover_input_stall(now, now - 1_000, now - 5_000, now - 120_000, 0, true));
+        // Stale input, but we just presented → give the user a moment.
+        assert!(!should_recover_input_stall(now, now - 1_000, 0, now - 5_000, 0, true));
+        // Live renderer, no input for a long time, nothing recent → recover.
+        assert!(should_recover_input_stall(now, now - 1_000, now - 60_000, now - 120_000, 0, true));
+        // ...but only once per cooldown.
+        assert!(!should_recover_input_stall(now, now - 1_000, now - 60_000, now - 120_000, now - 10_000, true));
+        // No interaction since the last recovery → never churn again.
+        assert!(!should_recover_input_stall(now, now - 1_000, now - 60_000, now - 120_000, now - 120_000, false));
+    }
+
+    #[test]
+    fn click_stall_recovery_fires_when_click_never_becomes_drag() {
+        let now = 1_000_000u64;
+        // Dead renderer → heartbeat path, never click-stall.
+        assert!(!should_recover_click_stall(now, 0, now - 10_000, 0, now - 60_000, 0));
+        // No click ever reached the page → nothing to detect.
+        assert!(!should_recover_click_stall(now, now - 1_000, 0, 0, now - 60_000, 0));
+        // Click just arrived → give the healthy page a moment to start the drag.
+        assert!(!should_recover_click_stall(now, now - 1_000, now - 1_000, 0, now - 60_000, 0));
+        // Click 2s old, still within grace → keep waiting.
+        assert!(!should_recover_click_stall(now, now - 1_000, now - 2_000, 0, now - 60_000, 0));
+        // Click 3s old with no drag → already a stall (grace is 2.5s), so it
+        // beats the user's ~6s Esc dismissal.
+        assert!(should_recover_click_stall(now, now - 1_000, now - 3_000, 0, now - 60_000, 0));
+        // Click older than the window → stale history, don't fire.
+        assert!(!should_recover_click_stall(now, now - 1_000, now - 60_000, 0, now - 120_000, 0));
+        // A drag started after the press → healthy, never recover.
+        assert!(!should_recover_click_stall(now, now - 1_000, now - 10_000, now - 9_000, now - 60_000, 0));
+        // We just presented → let the user reach for the thumbnail.
+        assert!(!should_recover_click_stall(now, now - 1_000, now - 10_000, 0, now - 1_000, 0));
+        // The ghost: click received, no drag, past grace + present + cooldown → recover.
+        assert!(should_recover_click_stall(now, now - 1_000, now - 10_000, 0, now - 60_000, 0));
+        // ...but only once per cooldown.
+        assert!(!should_recover_click_stall(now, now - 1_000, now - 10_000, 0, now - 60_000, now - 30_000));
+    }
+
+    #[test]
+    fn refresh_before_present_uses_its_own_throttle() {
+        let now = 1_000_000u64;
+        // Long idle, never refreshed or recovered → refresh.
+        assert!(should_refresh_before_present(now, now - 90_000, 90_000, 0, 0));
+        // Brand-new page that never reported input → nothing to refresh.
+        assert!(!should_refresh_before_present(now, 0, now, 0, 0));
+        // Input is recent → warm page, no refresh.
+        assert!(!should_refresh_before_present(now, now - 5_000, 5_000, 0, 0));
+        // Refreshed within the cooldown (rapid captures) → no second reload.
+        assert!(!should_refresh_before_present(
+            now,
+            now - 90_000,
+            90_000,
+            now - 30_000,
+            0
+        ));
+        // Just force-recovered → page is already fresh, skip the refresh.
+        assert!(!should_refresh_before_present(
+            now,
+            now - 90_000,
+            90_000,
+            0,
+            now - 30_000
+        ));
     }
 
     #[test]

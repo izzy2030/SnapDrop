@@ -9,6 +9,7 @@ use std::cell::Cell;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::OnceLock;
 use std::thread;
@@ -55,6 +56,16 @@ pub struct DragOutcome {
     pub moved: bool,
 }
 
+/// True while an OLE drag (or its movement poll) is in progress. During
+/// DoDragDrop's modal loop the pointer is owned by the drag operation, so the
+/// thumbnail webview legitimately receives no input events — the renderer
+/// watchdog must not mistake an in-flight drag for a stalled "ghost".
+static DRAG_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn is_drag_active() -> bool {
+    DRAG_ACTIVE.load(Ordering::SeqCst)
+}
+
 /// Entry point called from a Tauri command. Tauri commands run synchronously on
 /// the main thread, and OLE drag-and-drop must run on the UI thread that owns
 /// the app's windows (Chromium-based drop targets — WebView2/Electron, e.g. AI
@@ -64,6 +75,13 @@ pub struct DragOutcome {
 /// DoDragDrop runs its own modal message loop, so the main thread stays
 /// responsive to the OS for the duration of the drag.
 pub fn start_drag(_app: &tauri::AppHandle, path: &str) -> Result<DragOutcome, String> {
+    DRAG_ACTIVE.store(true, Ordering::SeqCst);
+    let result = start_drag_inner(path);
+    DRAG_ACTIVE.store(false, Ordering::SeqCst);
+    result
+}
+
+fn start_drag_inner(path: &str) -> Result<DragOutcome, String> {
     if !Path::new(path).exists() {
         return Err("File not found".into());
     }

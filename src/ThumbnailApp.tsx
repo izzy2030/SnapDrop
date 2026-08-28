@@ -39,6 +39,8 @@ export default function ThumbnailApp() {
   const seenCaptureIdsRef = useRef(new Set<number>());
   const dismissedCaptureIdsRef = useRef(new Set<number>());
   const reconcileInFlightRef = useRef(false);
+  const lastInputAtRef = useRef(0);
+  const lastInputReportAtRef = useRef(0);
 
   const removeFromStack = useCallback((path: string) => {
     setStack((s) => {
@@ -96,6 +98,11 @@ export default function ThumbnailApp() {
           api.debugLog(`reconcile end elapsed_ms=${Math.round(performance.now() - startedAt)}`).catch(() => {});
         });
     };
+    // WebView2 can drop the very first IPC call from a freshly created page
+    // (observed: the first debug_log invoke never reaches the backend, in every
+    // session). Send a throwaway probe first so the real diagnostics below are
+    // guaranteed to land in the log.
+    api.debugLog("ipc warmup").catch(() => {});
     api.debugLog(`renderer mounted href=${window.location.href} visibility=${document.visibilityState} dpr=${window.devicePixelRatio}`).catch(() => {});
     reconcileLatest();
     const reconcileTimer = window.setInterval(reconcileLatest, 1500);
@@ -207,9 +214,55 @@ export default function ThumbnailApp() {
     }
   };
 
+  // Input-liveness probe: report (throttled) that the page is receiving user
+  // input. The Rust watchdog treats a fresh heartbeat with no input for a long
+  // time while the window is on screen as a "ghost" (stale frame, dead drags)
+  // and reloads the webview. Also logs the input age so a stuck page shows up
+  // in the diagnostics.
+  useEffect(() => {
+    const onInput = (e: Event) => {
+      lastInputAtRef.current = Date.now();
+      // A pointerdown is the exact "user tried to grab it" signal: report it
+      // immediately (unthrottled) so the Rust watchdog can detect a click
+      // that never turns into a drag (the ghost). Only left-button presses
+      // without modifiers are potential drag attempts — the Rust watchdog
+      // treats a reported pointerdown as "a drag should follow", so right-
+      // clicks / modifier-clicks (which never drag) must not count.
+      if (e.type === "pointerdown") {
+        const pe = e as PointerEvent;
+        const dragAttempt =
+          pe.button === 0 && !pe.ctrlKey && !pe.metaKey && !pe.shiftKey && !pe.altKey;
+        if (dragAttempt) {
+          api.reportRendererPointerDown().catch(() => {});
+        }
+        api
+          .debugLog(
+            `renderer pointerdown button=${pe.button} ctrl=${pe.ctrlKey} meta=${pe.metaKey} shift=${pe.shiftKey} alt=${pe.altKey} drag_attempt=${dragAttempt}`
+          )
+          .catch(() => {});
+      }
+      if (Date.now() - lastInputReportAtRef.current >= 2000) {
+        lastInputReportAtRef.current = Date.now();
+        api.reportRendererInput().catch(() => {});
+      }
+    };
+    window.addEventListener("pointerdown", onInput, true);
+    window.addEventListener("pointermove", onInput, true);
+    window.addEventListener("keydown", onInput, true);
+    window.addEventListener("wheel", onInput, true);
+    window.addEventListener("touchstart", onInput, true);
+    return () => {
+      window.removeEventListener("pointerdown", onInput, true);
+      window.removeEventListener("pointermove", onInput, true);
+      window.removeEventListener("keydown", onInput, true);
+      window.removeEventListener("wheel", onInput, true);
+      window.removeEventListener("touchstart", onInput, true);
+    };
+  }, []);
+
   useEffect(() => {
     const reportVisibility = () => {
-      api.debugLog(`renderer visibility=${document.visibilityState} hidden=${document.hidden} stack=${stack.length} current_id=${stack[0]?.captureId ?? 0}`).catch(() => {});
+      api.debugLog(`renderer visibility=${document.visibilityState} hidden=${document.hidden} stack=${stack.length} current_id=${stack[0]?.captureId ?? 0} input_age_s=${Math.round((Date.now() - lastInputAtRef.current) / 1000)}`).catch(() => {});
     };
     document.addEventListener("visibilitychange", reportVisibility);
     window.addEventListener("pageshow", reportVisibility);

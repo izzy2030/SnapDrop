@@ -116,6 +116,8 @@ pub fn run() {
             commands::get_capture_preview,
             commands::get_latest_capture,
             commands::debug_log,
+            commands::report_renderer_input,
+            commands::report_renderer_pointerdown,
             commands::get_debug_log,
             commands::open_debug_log,
         ])
