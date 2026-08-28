@@ -1235,6 +1235,21 @@ body:has(.thumbnail-root) {
   background: #0d0f13;
 }
 
+/* Floating input for the text-label tool; positioned over the click point. */
+.editor-text-input {
+  position: absolute;
+  min-width: 140px;
+  padding: 2px 8px;
+  border: 2px solid #2f7bf6;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.95);
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-weight: 600;
+  outline: none;
+  z-index: 5;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+}
+
 .editor-hint {
   position: absolute;
   bottom: 14px;

@@ -72,7 +72,7 @@ recapturing:
 - **Re-drag last shot** — re-arms the OLE drag with the most recent file so
   the next drop target you click gets it.
 
-## Editor: arrows, text labels, numbered steps, blur/pixelate
+## Editor: arrows, text labels, numbered steps, blur/pixelate ✅ Completed
 
 The annotation set people actually use for **bug reports and tutorials**:
 
@@ -81,6 +81,10 @@ The annotation set people actually use for **bug reports and tutorials**:
 - Blur/pixelate regions for hiding emails, tokens, and personal data.
 - The editor already has strokes + undo; these are incremental tools on the
   same canvas.
+
+Also included: number-key tool shortcuts (**1–7**), palette colors for all
+annotation types, and deterministic commit → repaint → export so click-placed
+annotations (labels, step badges) always make it into the saved image.
 
 ## Screen recording → GIF/MP4
 

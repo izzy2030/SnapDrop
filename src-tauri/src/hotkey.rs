@@ -319,7 +319,10 @@ pub fn register_esc_hotkey(app: &AppHandle) {
             // would stay dimmed and frozen until clicked.
             crate::overlay::cancel_if_running();
             if crate::editor::is_visible(app) {
-                let _ = app.emit("editor-cancelled", ());
+                // The editor page decides: an open text input closes first,
+                // and with no input open the page re-emits "editor-cancelled"
+                // to close the editor.
+                let _ = app.emit("editor-esc", ());
             } else if crate::thumbnail::is_visible(app) {
                 let _ = crate::thumbnail::hide_all(app);
             }

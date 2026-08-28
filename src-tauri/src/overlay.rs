@@ -125,6 +125,13 @@ struct OverlayState {
     grab_offset: POINT,
     /// Edges under the cursor while resizing (EDGE_* bitmask).
     resize_edge: u8,
+    /// Modifier latches for the current press. Sampling GetAsyncKeyState only
+    /// at mouse-up races with the key-up: the raw-input thread applies a key
+    /// release immediately, while the mouse-up message waits in the queue
+    /// behind drag redraws — so "hold Ctrl from before the drag" was often
+    /// read as up. The latch ORs the state across the whole press.
+    press_ctrl: bool,
+    press_shift: bool,
 }
 
 // Only ever touched on the main thread (nested loop during capture).
@@ -162,6 +169,8 @@ fn state() -> &'static Mutex<OverlayState> {
             press_rect: RECT::default(),
             grab_offset: POINT::default(),
             resize_edge: 0,
+            press_ctrl: false,
+            press_shift: false,
         })
     })
 }
@@ -226,6 +235,8 @@ unsafe fn overlay_wndproc_inner(
             {
                 let mut st = lock_state();
                 let _ = SetCapture(hwnd);
+                st.press_ctrl = is_ctrl_down();
+                st.press_shift = is_shift_down();
                 if let Some(rect) = st.initial {
                     let edge = hit_edge(&rect, pos, RESIZE_TOL);
                     if edge != 0 || point_in_rect(&rect, pos) {
@@ -314,6 +325,9 @@ unsafe fn overlay_wndproc_inner(
                     OverlayMode::Select => {
                         if st.start.is_some() {
                             st.cur = pos;
+                            // Latch modifiers held at any point of the drag.
+                            st.press_ctrl |= is_ctrl_down();
+                            st.press_shift |= is_shift_down();
                         }
                     }
                     OverlayMode::None => {}
@@ -343,8 +357,10 @@ unsafe fn overlay_wndproc_inner(
                             // A click on the remembered area captures it now.
                             crate::debuglog::log("overlay: last-area confirmed (click)");
                             let rect = st.sel_rect;
-                            let ctrl_held = is_ctrl_down();
-                            let shift_held = is_shift_down();
+                            let ctrl_held = is_ctrl_down() || st.press_ctrl;
+                            let shift_held = is_shift_down() || st.press_shift;
+                            st.press_ctrl = false;
+                            st.press_shift = false;
                             st.mode = OverlayMode::None;
                             start_or_finish(&mut st, hwnd, rect, ctrl_held, shift_held);
                         }
@@ -357,8 +373,10 @@ unsafe fn overlay_wndproc_inner(
                                     && monitors::rect_height(&r) >= MIN_SELECTION
                             })
                             .unwrap_or(false);
-                        let ctrl_held = is_ctrl_down();
-                        let shift_held = is_shift_down();
+                        let ctrl_held = is_ctrl_down() || st.press_ctrl;
+                        let shift_held = is_shift_down() || st.press_shift;
+                        st.press_ctrl = false;
+                        st.press_shift = false;
                         crate::debuglog::log(&format!(
                             "overlay: mouse up, selection_ok={} ctrl_held={} shift_held={}",
                             ok, ctrl_held, shift_held
@@ -695,6 +713,8 @@ fn run_inner(initial_rect: Option<RECT>) -> Option<Selection> {
         st.press_rect = RECT::default();
         st.grab_offset = POINT::default();
         st.resize_edge = 0;
+        st.press_ctrl = false;
+        st.press_shift = false;
         if let Some(r) = st.initial {
             st.sel_rect = r;
             crate::debuglog::log(&format!("overlay: last-area mode rect={:?}", r));
