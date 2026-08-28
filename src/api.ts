@@ -18,6 +18,8 @@ export interface Settings {
   close_to_tray: boolean;
   ocr_hotkey: string;
   capture_delay_secs: number;
+  last_area_hotkey: string;
+  last_area: { x: number; y: number; width: number; height: number } | null;
 }
 
 export interface HistoryEntry {

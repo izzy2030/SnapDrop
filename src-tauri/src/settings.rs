@@ -36,6 +36,21 @@ pub struct Settings {
     /// 0 = capture immediately on release. Delayed capture exists so the
     /// user can open menus/tooltips before the screenshot is taken.
     pub capture_delay_secs: u32,
+    /// Global hotkey: re-open the selection overlay pre-positioned on the
+    /// last captured region (click to capture again, drag to move/resize).
+    pub last_area_hotkey: String,
+    /// The most recently captured region (virtual-screen coords). Seeded by
+    /// every image capture; None until the first screenshot.
+    pub last_area: Option<LastArea>,
+}
+
+/// A previously captured region, in physical virtual-screen coordinates.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LastArea {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
 }
 
 impl Default for Settings {
@@ -60,6 +75,8 @@ impl Default for Settings {
             // Duration of the delayed capture, armed by holding Shift while
             // selecting. 0 = Shift does nothing (instant capture).
             capture_delay_secs: 3,
+            last_area_hotkey: "Ctrl+Alt+4".into(),
+            last_area: None,
         }
     }
 }
@@ -141,6 +158,26 @@ mod tests {
         assert_eq!(s.max_history, 10);
         assert!(s.copy_to_clipboard);
         assert!(s.start_with_windows);
+        assert_eq!(s.last_area_hotkey, "Ctrl+Alt+4");
+        assert!(s.last_area.is_none());
+    }
+
+    #[test]
+    fn last_area_roundtrip() {
+        let mut s = Settings::default();
+        s.last_area = Some(LastArea {
+            x: 100,
+            y: 200,
+            width: 640,
+            height: 480,
+        });
+        let raw = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back.last_area, s.last_area);
+        // Old settings files without the field default to None.
+        let partial = serde_json::from_str::<Settings>("{}").unwrap();
+        assert!(partial.last_area.is_none());
+        assert_eq!(partial.last_area_hotkey, "Ctrl+Alt+4");
     }
 
     #[test]

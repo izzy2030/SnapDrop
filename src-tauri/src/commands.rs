@@ -76,6 +76,13 @@ pub fn update_settings(app: AppHandle, settings: settings::Settings) -> Result<(
         }
     }
 
+    // Same for the last-area hotkey.
+    if settings.last_area_hotkey != old.last_area_hotkey {
+        if let Err(e) = hotkey::apply_last_area_settings(&app, &settings.last_area_hotkey) {
+            return Err(e);
+        }
+    }
+
     // Autostart toggle.
     if settings.start_with_windows != old.start_with_windows {
         use tauri_plugin_autostart::ManagerExt;

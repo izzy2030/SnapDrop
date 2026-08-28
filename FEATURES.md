@@ -18,15 +18,34 @@ dropdown menus and tooltips that close when they lose focus.
   + remaining seconds) so you can open the menu or hover the tooltip; the
   shot fires automatically. Esc cancels. Normal captures stay instant.
 
-## Multi-file drag from the stack
+## Last area re-capture ✅ Completed
 
-Drag **3 recent captures into Discord in one gesture** instead of one at a
+Re-capture the same region without re-drawing the box — the Icecream "Last
+area" muscle memory.
+
+- **Shipped**: press **Ctrl+Alt+4** (configurable in Settings → Capture →
+  "Last Area Hotkey") and the selection overlay opens already positioned on
+  the previously captured area, with corner handles.
+  **Click the box to capture instantly**; drag inside to move it, drag an
+  edge to resize it, drag elsewhere for a fresh selection (which becomes the
+  new last area). Esc cancels. Every image capture records the new last
+  area automatically.
+- Composes with the other overlay modifiers: hold **Shift** while clicking to
+  arm the delayed capture, **Ctrl** to flip the editor decision.
+
+## Multi-file drag from the stack ✅ Completed
+
+Drag **several captures into Discord in one gesture** instead of one at a
 time.
 
-- The OLE drag in `dragdrop.rs` already builds a `CF_HDROP`; extending it to
-  several files is a small change.
-- Selection UI: expand the thumbnail stack (or use the history gallery) and
-  drag the selected set.
+- **Shipped**: in the history gallery, **Ctrl+click** (or Shift+click for a
+  range) selects multiple captures — blue highlight + checkmark — and
+  dragging any selected row/card shares the whole set as separate
+  attachments. Esc or clicking empty canvas clears the selection.
+- `dragdrop.rs` now builds a multi-path `CF_HDROP`; the drag image comes
+  from the first file and move-drop cleanup deletes every dragged file when
+  "keep file after drag" is off.
+- Possible follow-up: multi-drag straight from the floating thumbnail stack.
 
 ## OCR — copy text from a screenshot ✅ Completed
 

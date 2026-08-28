@@ -2,7 +2,7 @@ use std::ffi::c_void;
 use std::fs;
 use chrono::Local;
 use tauri::{AppHandle, Manager};
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
     IsIconic, ShowWindow, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE,
 };
@@ -98,8 +98,6 @@ fn run_inner(app: &AppHandle) {
     // Brief sleep to ensure DWM compositor updates the screen before capture overlay starts
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    // Snapshot settings up front: the overlay needs the editor toggle to label
-    // its Ctrl hint, and nothing here changes mid-capture.
     let settings = settings::get(app);
 
     // The overlay handles delayed capture itself: holding Shift while
@@ -116,6 +114,79 @@ fn run_inner(app: &AppHandle) {
             return;
         }
     };
+    finish_capture(app, sel, main_was_visible, main_was_minimized);
+}
+
+/// "Last area" capture (Ctrl+Alt+4): same pipeline, but the overlay opens
+/// pre-positioned on the previously captured region — click to re-capture it
+/// instantly, drag inside to move, drag an edge to resize, drag elsewhere for
+/// a fresh selection.
+pub fn run_last_area(app: &AppHandle) {
+    crate::debuglog::log("last-area capture flow: start");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_last_area_inner(app)
+    }));
+    if let Err(payload) = result {
+        crate::debuglog::log(&format!(
+            "last-area capture flow: PANIC {}",
+            crate::panic_message(&payload)
+        ));
+        log::error!(
+            "last-area capture flow panicked: {}",
+            crate::panic_message(&payload)
+        );
+        if let Some(main_win) = app.get_webview_window("main") {
+            let _ = main_win.show();
+        }
+        notifier::toast(app, "error", "Capture failed unexpectedly");
+    }
+}
+
+fn run_last_area_inner(app: &AppHandle) {
+    let was_visible = thumbnail::is_visible(app);
+    let (main_was_visible, main_was_minimized) = hide_for_capture(app);
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let settings = settings::get(app);
+    let initial = settings.last_area.map(|la| RECT {
+        left: la.x,
+        top: la.y,
+        right: la.x + la.width,
+        bottom: la.y + la.height,
+    });
+
+    // No remembered area yet (first run) — fall back to a normal selection;
+    // whatever the user picks becomes the new last area.
+    let sel = match initial {
+        Some(rect) => overlay::run_last_area(
+            settings.show_editor_after_capture,
+            settings.capture_delay_secs,
+            rect,
+        ),
+        None => overlay::run(settings.show_editor_after_capture, settings.capture_delay_secs),
+    };
+    let Some(sel) = sel else {
+        crate::debuglog::log("last-area capture flow: overlay cancelled");
+        if was_visible {
+            let _ = thumbnail::set_visible(app, true);
+        }
+        restore_main_window(app, main_was_visible, main_was_minimized);
+        return;
+    };
+    finish_capture(app, sel, main_was_visible, main_was_minimized);
+}
+
+/// Shared tail of every image-capture flow: capture the region, save it,
+/// clipboard/history, editor-or-thumbnail, and restore the main window.
+/// Also records the selection as the "last area" for the re-capture hotkey.
+fn finish_capture(
+    app: &AppHandle,
+    sel: overlay::Selection,
+    main_was_visible: bool,
+    main_was_minimized: bool,
+) {
+    let settings = settings::get(app);
     if sel.shift_held && settings.capture_delay_secs > 0 {
         crate::debuglog::log(&format!(
             "capture flow: delayed capture active ({}s, shift-held)",
@@ -137,6 +208,19 @@ fn run_inner(app: &AppHandle) {
         notifier::toast(app, "error", "Couldn't capture screen region");
         return;
     };
+
+    // Remember this selection as the "last area" so Ctrl+Alt+4 can re-open
+    // it. Same virtual-screen coordinates as the overlay uses.
+    {
+        let mut s = settings::get(app);
+        s.last_area = Some(settings::LastArea {
+            x: sel.rect.left,
+            y: sel.rect.top,
+            width: monitors::rect_width(&sel.rect),
+            height: monitors::rect_height(&sel.rect),
+        });
+        let _ = settings::save(app, &s);
+    }
 
     let dir = settings::resolved_dir(&settings);
     // Notify when the configured folder was unusable and we fell back to the default.

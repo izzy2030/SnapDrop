@@ -1030,6 +1030,14 @@ export default function SettingsApp() {
                   </div>
 
                   <div className="field">
+                    <span className="field-label">Last Area Hotkey</span>
+                    <span className="field-hint">Re-opens the selection on the last captured area — click to capture instantly, drag to move or resize.</span>
+                    <div style={{ marginTop: 6 }}>
+                      <HotkeyField value={settings.last_area_hotkey} onChange={(v) => set({ last_area_hotkey: v })} />
+                    </div>
+                  </div>
+
+                  <div className="field">
                     <span className="field-label">Screenshot Directory</span>
                     <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
                       <input
@@ -1109,6 +1117,10 @@ export default function SettingsApp() {
                     <div className="shortcut-item">
                       <span className="shortcut-label">While selecting: delayed capture (fire after countdown)</span>
                       <kbd className="shortcut-keys">Hold Shift</kbd>
+                    </div>
+                    <div className="shortcut-item">
+                      <span className="shortcut-label">Re-capture the last area (click the box to capture instantly)</span>
+                      <kbd className="shortcut-keys">{settings.last_area_hotkey || "Ctrl+Alt+4"}</kbd>
                     </div>
                     <div className="shortcut-item">
                       <span className="shortcut-label">Dismiss floating thumbnail or cancel</span>

@@ -19,6 +19,8 @@ pub struct CurrentShortcut(pub Mutex<Option<Shortcut>>);
 
 pub struct CurrentOcrShortcut(pub Mutex<Option<Shortcut>>);
 
+pub struct CurrentLastAreaShortcut(pub Mutex<Option<Shortcut>>);
+
 pub fn current(app: &AppHandle) -> Option<Shortcut> {
     app.try_state::<CurrentShortcut>()
         .and_then(|s| s.inner().0.lock().unwrap().clone())
@@ -26,6 +28,11 @@ pub fn current(app: &AppHandle) -> Option<Shortcut> {
 
 pub fn current_ocr(app: &AppHandle) -> Option<Shortcut> {
     app.try_state::<CurrentOcrShortcut>()
+        .and_then(|s| s.inner().0.lock().unwrap().clone())
+}
+
+pub fn current_last_area(app: &AppHandle) -> Option<Shortcut> {
+    app.try_state::<CurrentLastAreaShortcut>()
         .and_then(|s| s.inner().0.lock().unwrap().clone())
 }
 
@@ -77,6 +84,28 @@ pub fn init(app: &AppHandle) {
         Err(e) => log::warn!("ocr hotkey registration failed (conflict?): {e}"),
     }
 
+    // Last-area hotkey: re-open the overlay on the previously captured region
+    // (click to re-capture instantly, drag to move/resize).
+    let last_area_shortcut = match parse_shortcut(&settings.last_area_hotkey) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("invalid last-area hotkey in settings: {e}; using default");
+            Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::Digit4)
+        }
+    };
+    app.manage(CurrentLastAreaShortcut(Mutex::new(Some(last_area_shortcut.clone()))));
+    match app.global_shortcut().on_shortcut(last_area_shortcut.clone(), |app, _sc, event| {
+        if event.state() == ShortcutState::Pressed {
+            trigger_capture_last_area(app);
+        }
+    }) {
+        Ok(()) => log::info!(
+            "last-area hotkey registered: {}",
+            shortcut_to_string(&last_area_shortcut)
+        ),
+        Err(e) => log::warn!("last-area hotkey registration failed (conflict?): {e}"),
+    }
+
     // Esc dismisses the floating thumbnail (registered once; acts only while
     // the thumbnail is visible).
     register_esc_hotkey(app);
@@ -113,6 +142,35 @@ pub fn trigger_capture(app: &AppHandle) {
         });
         // If the event loop is gone (app shutting down) the task never runs;
         // release the reentrancy guard so the flag can't get stuck.
+        if sent.is_err() {
+            CAPTURING.store(false, Ordering::SeqCst);
+        }
+    });
+}
+
+/// Last-area variant of `trigger_capture`: same reentrancy guard and
+/// main-thread hop, but the overlay opens pre-positioned on the previously
+/// captured region instead of a blank selection.
+pub fn trigger_capture_last_area(app: &AppHandle) {
+    if CAPTURING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        let app3 = app2.clone();
+        let sent = app2.run_on_main_thread(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                capture_flow::run_last_area(&app3);
+            }));
+            if let Err(payload) = result {
+                log::error!(
+                    "last-area capture flow panicked: {}",
+                    crate::panic_message(&payload)
+                );
+                let _ = notifier::toast(&app3, "error", "Capture failed unexpectedly");
+            }
+            CAPTURING.store(false, Ordering::SeqCst);
+        });
         if sent.is_err() {
             CAPTURING.store(false, Ordering::SeqCst);
         }
@@ -175,19 +233,37 @@ pub fn apply_settings(app: &AppHandle, hotkey_str: &str) -> Result<(), String> {
 pub fn pause(app: &AppHandle, paused: bool) {
     let sc = current(app);
     let osc = current_ocr(app);
+    let lac = current_last_area(app);
     if paused {
-        if let Some(s) = &sc {
-            let _ = app.global_shortcut().unregister(s.clone());
-        }
-        if let Some(s) = &osc {
-            let _ = app.global_shortcut().unregister(s.clone());
+        for s in [sc, osc, lac].into_iter().flatten() {
+            let _ = app.global_shortcut().unregister(s);
         }
     } else {
-        if let Some(s) = &sc {
-            let _ = app.global_shortcut().register(s.clone());
+        for s in [sc, osc, lac].into_iter().flatten() {
+            let _ = app.global_shortcut().register(s);
         }
-        if let Some(s) = &osc {
-            let _ = app.global_shortcut().register(s.clone());
+    }
+}
+
+/// Re-register the last-area hotkey from settings. Returns Err on conflict.
+pub fn apply_last_area_settings(app: &AppHandle, hotkey_str: &str) -> Result<(), String> {
+    let shortcut = parse_shortcut(hotkey_str)?;
+    let old = current_last_area(app);
+    if let Some(o) = &old {
+        let _ = app.global_shortcut().unregister(o.clone());
+    }
+    match app.global_shortcut().register(shortcut.clone()) {
+        Ok(()) => {
+            if let Some(state) = app.try_state::<CurrentLastAreaShortcut>() {
+                *state.inner().0.lock().unwrap() = Some(shortcut);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if let Some(o) = &old {
+                let _ = app.global_shortcut().register(o.clone());
+            }
+            Err(format!("Could not register {hotkey_str}: {e}"))
         }
     }
 }
