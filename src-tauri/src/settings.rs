@@ -39,6 +39,9 @@ pub struct Settings {
     /// Global hotkey: re-open the selection overlay pre-positioned on the
     /// last captured region (click to capture again, drag to move/resize).
     pub last_area_hotkey: String,
+    /// Global hotkey: select a region on screen and start video-recording it
+    /// (Ctrl+Alt+V by default).
+    pub video_hotkey: String,
     /// The most recently captured region (virtual-screen coords). Seeded by
     /// every image capture; None until the first screenshot.
     pub last_area: Option<LastArea>,
@@ -76,6 +79,7 @@ impl Default for Settings {
             // selecting. 0 = Shift does nothing (instant capture).
             capture_delay_secs: 3,
             last_area_hotkey: "Ctrl+Alt+4".into(),
+            video_hotkey: "Ctrl+Alt+V".into(),
             last_area: None,
         }
     }
@@ -159,6 +163,7 @@ mod tests {
         assert!(s.copy_to_clipboard);
         assert!(s.start_with_windows);
         assert_eq!(s.last_area_hotkey, "Ctrl+Alt+4");
+        assert_eq!(s.video_hotkey, "Ctrl+Alt+V");
         assert!(s.last_area.is_none());
     }
 
@@ -178,6 +183,7 @@ mod tests {
         let partial = serde_json::from_str::<Settings>("{}").unwrap();
         assert!(partial.last_area.is_none());
         assert_eq!(partial.last_area_hotkey, "Ctrl+Alt+4");
+        assert_eq!(partial.video_hotkey, "Ctrl+Alt+V");
     }
 
     #[test]

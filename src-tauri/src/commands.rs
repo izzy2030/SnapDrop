@@ -21,6 +21,13 @@ fn preview_cache() -> &'static Mutex<HashMap<String, String>> {
 }
 
 fn build_capture_preview(path: &str) -> Result<String, String> {
+    // Videos: ask the Windows Shell thumbnailer (the same one Explorer uses)
+    // for a real frame from the file. If that fails, return an empty preview
+    // and the gallery renders the placeholder video card (play icon +
+    // duration).
+    if is_video_path(path) {
+        return Ok(video_thumbnail_data_url(path).unwrap_or_default());
+    }
     use base64::Engine;
     if let Ok(reader) = image::ImageReader::open(path).and_then(|r| r.with_guessed_format()) {
         if let Ok(img) = reader.decode() {
@@ -41,6 +48,124 @@ fn build_capture_preview(path: &str) -> Result<String, String> {
     let bytes = fs::read(path).map_err(|e| e.to_string())?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(format!("data:image/png;base64,{b64}"))
+}
+
+/// Whether a path looks like a video file (mp4/mkv/webm/avi/mov).
+fn is_video_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    [".mp4", ".mkv", ".webm", ".avi", ".mov"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+}
+
+/// Extract a video frame thumbnail via the Windows Shell thumbnailer
+/// (`IShellItemImageFactory`, the same mechanism Explorer uses), converted to
+/// a PNG data URL. Returns None on any failure — the gallery then falls back
+/// to the placeholder video card.
+fn video_thumbnail_data_url(path: &str) -> Option<String> {
+    use std::ffi::c_void;
+    use std::mem::size_of;
+    use windows::Win32::Foundation::SIZE;
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, BI_RGB, BITMAP,
+        BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
+    };
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::{
+        IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_THUMBNAILONLY,
+    };
+    use windows::Win32::System::Com::IBindCtx;
+    use windows::core::{Interface, PCWSTR};
+    use base64::Engine;
+
+    unsafe {
+        // COM must be initialized on this (blocking-pool) thread for the
+        // shell calls below.
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+
+        // Normalize to backslashes: some shell APIs reject forward slashes.
+        let norm = path.replace('/', "\\");
+        let wide: Vec<u16> = norm.encode_utf16().chain(Some(0)).collect();
+        let item: IShellItem = match SHCreateItemFromParsingName::<PCWSTR, Option<&IBindCtx>, _>(
+            PCWSTR(wide.as_ptr()),
+            None,
+        ) {
+            Ok(i) => i,
+            Err(e) => {
+                crate::debuglog::log(&format!("video_thumb: SHCreateItemFromParsingName failed: {e}"));
+                CoUninitialize();
+                return None;
+            }
+        };
+        let factory: IShellItemImageFactory = match item.cast() {
+            Ok(f) => f,
+            Err(e) => {
+                crate::debuglog::log(&format!("video_thumb: cast to IShellItemImageFactory failed: {e}"));
+                CoUninitialize();
+                return None;
+            }
+        };
+        // Thumbnail-only (no icon overlay), fit within the 256 box without
+        // cropping (SIIGBF_RESIZETOFIT = 0 is the default sizing).
+        let hbm = match factory.GetImage(SIZE { cx: 256, cy: 256 }, SIIGBF_THUMBNAILONLY) {
+            Ok(b) => b,
+            Err(e) => {
+                crate::debuglog::log(&format!("video_thumb: GetImage failed: {e}"));
+                CoUninitialize();
+                return None;
+            }
+        };
+
+        let mut bmp = BITMAP::default();
+        GetObjectW(
+            hbm.into(),
+            size_of::<BITMAP>() as i32,
+            Some(&mut bmp as *mut BITMAP as *mut c_void),
+        );
+        let (w, h) = (bmp.bmWidth, bmp.bmHeight);
+        if w <= 0 || h <= 0 {
+            let _ = DeleteObject(hbm.into());
+            CoUninitialize();
+            return None;
+        }
+
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let mut bi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h, // top-down rows
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            bmiColors: [Default::default()],
+        };
+        let dc = CreateCompatibleDC(None);
+        let got = GetDIBits(
+            dc,
+            hbm,
+            0,
+            h as u32,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            &mut bi,
+            DIB_RGB_COLORS,
+        );
+        let _ = DeleteObject(hbm.into());
+        let _ = DeleteDC(dc);
+        CoUninitialize();
+        if got == 0 {
+            return None;
+        }
+
+        // The DIB is BGRA, top-down — exactly what preview_png expects.
+        let png = crate::filename::preview_png(&buf, w as u32, h as u32, 256)?;
+        Some(format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&png)
+        ))
+    }
 }
 
 #[tauri::command]
@@ -83,6 +208,13 @@ pub fn update_settings(app: AppHandle, settings: settings::Settings) -> Result<(
         }
     }
 
+    // Same for the video-recording hotkey.
+    if settings.video_hotkey != old.video_hotkey {
+        if let Err(e) = hotkey::apply_video_settings(&app, &settings.video_hotkey) {
+            return Err(e);
+        }
+    }
+
     // Autostart toggle.
     if settings.start_with_windows != old.start_with_windows {
         use tauri_plugin_autostart::ManagerExt;
@@ -105,7 +237,9 @@ pub fn get_history(app: AppHandle) -> Vec<history::HistoryEntry> {
 
 #[tauri::command]
 pub fn delete_capture(app: AppHandle, path: String) -> Result<(), String> {
-    let _ = fs::remove_file(&path);
+    if let Err(e) = fs::remove_file(&path) {
+        crate::debuglog::log(&format!("history: delete failed for {path}: {e}"));
+    }
     history::remove(&app, &path);
     crate::tray::refresh(&app);
     Ok(())
@@ -448,6 +582,106 @@ pub fn copy_capture(_app: AppHandle, path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+#[cfg(windows)]
+pub async fn video_record_stop(
+    app: AppHandle,
+) -> Result<crate::video_recording::RecordingResult, String> {
+    // Runs on the async runtime thread, NOT the main/UI thread. Stopping joins
+    // the WGC capture thread, which finalizes the encoder by blocking on the
+    // Media Foundation transcoder join. That whole chain would otherwise run on
+    // the UI thread and freeze SnapDrop ("Not Responding").
+    tauri::async_runtime::spawn_blocking(move || crate::video_recording::stop_recording(&app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+#[cfg(windows)]
+pub fn video_record_state(app: AppHandle) -> bool {
+    use tauri::Manager;
+    app.state::<Mutex<crate::video_recording::VideoRecorder>>()
+        .lock()
+        .unwrap()
+        .is_recording()
+}
+
+/// Start recording the armed region (picked via Ctrl+Alt+V). Called by the
+/// toolbar's Rec button. Runs off the main thread — `start_recording` spins
+/// up the WGC capture session.
+#[tauri::command]
+#[cfg(windows)]
+pub async fn video_record_begin(app: AppHandle) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let pending = {
+            let rec_state = app.state::<Mutex<crate::video_recording::VideoRecorder>>();
+            let mut rec = rec_state.lock().unwrap();
+            rec.take_pending()
+        };
+        let Some(p) = pending else {
+            return Err("No region selected — press Ctrl+Alt+V first".to_string());
+        };
+        match crate::video_recording::start_recording(&app, p.region, p.path, 30) {
+            Ok(path) => Ok(path),
+            Err(e) => {
+                // Start failed (e.g. the monitor was unplugged). The pending
+                // slot is already consumed, so restore the main window the way
+                // it was before the selection overlay — otherwise the app stays
+                // hidden while nothing records.
+                crate::toolbar::hide(&app);
+                crate::toolbar::hide_border(&app);
+                crate::capture_flow::restore_main_window(&app, p.was_visible, p.was_minimized);
+                crate::debuglog::log(&format!("video: start failed, restored window: {e}"));
+                Err(e)
+            }
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Cancel an armed (not yet started) recording: clears the pending region,
+/// hides the toolbar, and restores the main window the way it was.
+#[tauri::command]
+#[cfg(windows)]
+pub fn video_record_arm_cancel(app: AppHandle) -> Result<(), String> {
+    let (was_visible, was_minimized) = {
+        let rec_state = app.state::<Mutex<crate::video_recording::VideoRecorder>>();
+        let mut rec = rec_state.lock().unwrap();
+        match rec.take_pending() {
+            Some(p) => (p.was_visible, p.was_minimized),
+            None => (true, false),
+        }
+    };
+    crate::toolbar::hide(&app);
+    crate::toolbar::hide_border(&app);
+    // If a recording is actually live (Rec clicked, then Cancel clicked in
+    // the same instant), don't restore the app window back into view —
+    // SnapDrop would film itself. Just drop the armed toolbar/border and
+    // leave the live session alone.
+    if crate::video_recording::is_recording_active() {
+        crate::debuglog::log("video: cancel ignored (a recording is active)");
+        return Ok(());
+    }
+    crate::capture_flow::restore_main_window(&app, was_visible, was_minimized);
+    crate::debuglog::log("video: armed recording cancelled");
+    Ok(())
+}
+
+/// Toggle the system-audio mute; returns the new state for the toolbar UI.
+#[tauri::command]
+#[cfg(windows)]
+pub fn video_toggle_mute() -> bool {
+    crate::toolbar::toggle_mute()
+}
+
+/// Current muted state (toolbar reads it on mount).
+#[tauri::command]
+#[cfg(windows)]
+pub fn video_mute_state() -> bool {
+    crate::toolbar::is_muted()
+}
+
+#[tauri::command]
 pub fn capture_now(app: AppHandle) -> Result<(), String> {
     hotkey::trigger_capture(&app);
     Ok(())
@@ -469,11 +703,15 @@ pub async fn get_capture_preview(_app: AppHandle, path: String) -> Result<String
         .await
         .map_err(|e| e.to_string())?;
     if let Ok(url) = &result {
-        let mut cache = preview_cache().lock().unwrap();
-        if cache.len() > 64 {
-            cache.clear(); // captures are capped by max_history anyway
+        // Don't cache empty results: a failed video thumbnail would otherwise be
+        // stuck as an empty string forever and never retried.
+        if !url.is_empty() {
+            let mut cache = preview_cache().lock().unwrap();
+            if cache.len() > 64 {
+                cache.clear(); // captures are capped by max_history anyway
+            }
+            cache.insert(path, url.clone());
         }
-        cache.insert(path, url.clone());
     }
     result
 }
@@ -693,6 +931,44 @@ mod debug_tests {
         }
         unsafe {
             CoUninitialize();
+        }
+    }
+}
+
+#[cfg(test)]
+mod video_thumb_tests {
+    use super::*;
+
+    /// Dev-machine smoke test: if any SnapDrop_video_*.mp4 exists in the
+    /// default Pictures/SnapDrop folder, extract its frame via the Windows
+    /// Shell thumbnailer and assert a PNG data URL comes back. Skips silently
+    /// when no recording exists yet (e.g. CI or a fresh machine).
+    #[test]
+    fn video_thumbnail_from_real_recording() {
+        let dir = std::env::var("USERPROFILE")
+            .map(|p| std::path::Path::new(&p).join("Pictures").join("SnapDrop"))
+            .unwrap_or_default();
+        let mut found = false;
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with("SnapDrop_video_") && name.ends_with(".mp4") {
+                    let url = video_thumbnail_data_url(p.to_string_lossy().as_ref());
+                    assert!(url.is_some(), "shell thumbnail failed for {}", p.display());
+                    let url = url.unwrap();
+                    assert!(
+                        url.starts_with("data:image/png;base64,"),
+                        "unexpected preview payload"
+                    );
+                    assert!(url.len() > 100, "thumbnail suspiciously small");
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            eprintln!("skipping: no SnapDrop_video_*.mp4 in {:?}", dir);
         }
     }
 }

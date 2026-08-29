@@ -19,6 +19,7 @@ export interface Settings {
   ocr_hotkey: string;
   capture_delay_secs: number;
   last_area_hotkey: string;
+  video_hotkey: string;
   last_area: { x: number; y: number; width: number; height: number } | null;
 }
 
@@ -28,6 +29,8 @@ export interface HistoryEntry {
   size_bytes?: number;
   width?: number;
   height?: number;
+  kind?: string;
+  duration_secs?: number;
 }
 
 export interface CapturedPayload {
@@ -62,6 +65,7 @@ export const api = {
   startDrag: (paths: string[]) => invoke<DragOutcome>("start_drag", { paths }),
   copyCapture: (path: string) => invoke<void>("copy_capture", { path }),
   captureNow: () => invoke<void>("capture_now"),
+  videoRecordState: () => invoke<boolean>("video_record_state"),
   hideThumbnail: () => invoke<void>("hide_thumbnail"),
   pauseHotkey: (paused: boolean) => invoke<void>("pause_hotkey", { paused }),
   getAppVersion: () => invoke<string>("get_app_version"),

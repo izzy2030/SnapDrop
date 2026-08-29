@@ -29,6 +29,8 @@ export default defineConfig({
         main: "index.html",
         thumbnail: "thumbnail.html",
         editor: "editor.html",
+        recorder: "recorder.html",
+        recorder_border: "recorder_border.html",
       },
     },
   },

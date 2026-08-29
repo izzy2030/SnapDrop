@@ -20,8 +20,9 @@ use crate::{
 
 /// Show the main window again in its previous state WITHOUT activating it, so
 /// SnapDrop never steals focus from the app the user was working in — it just
-/// stays on the taskbar.
-fn restore_main_window(app: &AppHandle, was_visible: bool, was_minimized: bool) {
+/// stays on the taskbar. `pub(crate)` so the video-record cancel command can
+/// restore the window after an armed (but cancelled) recording.
+pub(crate) fn restore_main_window(app: &AppHandle, was_visible: bool, was_minimized: bool) {
     if !was_visible {
         return;
     }
@@ -400,4 +401,100 @@ fn run_text_inner(app: &AppHandle) {
             Err(e) => notifier::toast(&app2, "error", &e),
         }
     });
+}
+
+/// Video-recording flow (Ctrl+Alt+V): select a region on screen and start
+/// recording it to an MP4 immediately. The app hides itself (so it never
+/// appears in the footage) and the tray gains a "Stop Recording" item.
+pub fn run_video(app: &AppHandle) {
+    crate::debuglog::log("video capture flow: start");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_video_inner(app)));
+    if let Err(payload) = result {
+        crate::debuglog::log(&format!(
+            "video capture flow: PANIC {}",
+            crate::panic_message(&payload)
+        ));
+        log::error!(
+            "video capture flow panicked: {}",
+            crate::panic_message(&payload)
+        );
+        if let Some(main_win) = app.get_webview_window("main") {
+            let _ = main_win.show();
+        }
+        notifier::toast(app, "error", "Video capture failed unexpectedly");
+    }
+}
+
+fn run_video_inner(app: &AppHandle) {
+    // Don't arm a second region while a recording is already running.
+    if crate::video_recording::is_recording_active() {
+        notifier::toast(app, "info", "A recording is already active — stop it first.");
+        return;
+    }
+    let (main_was_visible, main_was_minimized) = hide_for_capture(app);
+
+    // Brief sleep to ensure DWM compositor updates the screen before the overlay starts.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // No editor, no delayed capture for video — the region is the recording.
+    let Some(sel) = overlay::run(false, 0) else {
+        crate::debuglog::log("video capture flow: overlay cancelled");
+        restore_main_window(app, main_was_visible, main_was_minimized);
+        return;
+    };
+    crate::debuglog::log(&format!("video capture flow: selection rect={:?}", sel.rect));
+
+    // Remember this selection as the "last area" so Ctrl+Alt+4 (image) and the
+    // Settings Start button reuse the same region.
+    {
+        let mut s = settings::get(app);
+        s.last_area = Some(settings::LastArea {
+            x: sel.rect.left,
+            y: sel.rect.top,
+            width: monitors::rect_width(&sel.rect),
+            height: monitors::rect_height(&sel.rect),
+        });
+        let _ = settings::save(app, &s);
+    }
+
+    let settings = settings::get(app);
+    let dir = settings::resolved_dir(&settings);
+    if filename::expand_dir(&settings.screenshot_dir) != dir {
+        notifier::toast(
+            app,
+            "error",
+            "Screenshot folder is not writable — using Pictures\\SnapDrop.",
+        );
+    }
+    let path = dir.join(format!(
+        "SnapDrop_video_{}.mp4",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    let rect = RECT {
+        left: sel.rect.left,
+        top: sel.rect.top,
+        right: sel.rect.right,
+        bottom: sel.rect.bottom,
+    };
+
+    // Arm the recording: store the region + path and show the floating
+    // toolbar (Rec / cancel). Recording starts when the user clicks Rec; the
+    // app stays hidden meanwhile so it can't appear in the footage. If they
+    // cancel, `video_record_arm_cancel` restores the main window.
+    {
+        let rec_state = app.state::<std::sync::Mutex<crate::video_recording::VideoRecorder>>();
+        rec_state
+            .lock()
+            .unwrap()
+            .arm(rect, path.to_string_lossy().to_string(), main_was_visible, main_was_minimized);
+    }
+    crate::toolbar::arm(app, rect);
+    // Show the dashed region border right away (it persists through the
+    // recording) so the user sees exactly what will be recorded.
+    crate::toolbar::show_border(app, rect);
+    crate::debuglog::log(&format!(
+        "video capture flow: armed region {:?} -> {}",
+        rect,
+        path.display()
+    ));
 }

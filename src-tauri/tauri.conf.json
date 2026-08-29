@@ -51,6 +51,36 @@
         "shadow": false,
         "resizable": false,
         "focus": true
+      },
+      {
+        "label": "recorder_toolbar",
+        "title": "SnapDrop Recorder",
+        "url": "recorder.html",
+        "width": 320,
+        "height": 54,
+        "visible": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": false,
+        "resizable": false,
+        "focus": false
+      },
+      {
+        "label": "recorder_border",
+        "title": "SnapDrop Recorder Border",
+        "url": "recorder_border.html",
+        "width": 320,
+        "height": 200,
+        "visible": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": false,
+        "resizable": false,
+        "focus": false
       }
     ],
     "security": {

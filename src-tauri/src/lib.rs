@@ -16,7 +16,16 @@ mod notifier;
 mod overlay;
 mod settings;
 mod thumbnail;
+mod toolbar;
 mod tray;
+
+#[cfg(windows)]
+mod video_recording;
+mod audio;
+#[cfg(windows)]
+use std::sync::Mutex;
+#[cfg(windows)]
+use video_recording::VideoRecorder;
 
 use std::sync::atomic::AtomicBool;
 use tauri::{Manager, RunEvent};
@@ -71,6 +80,7 @@ pub fn run() {
             settings::init(app.handle())?;
             history::init(app.handle())?;
             hotkey::init(app.handle());
+            hotkey::init_video_hotkey(app.handle());
             tray::init(app.handle())?;
             editor::init(app.handle());
             let _ = thumbnail::hide_all(app.handle());
@@ -152,7 +162,14 @@ pub fn run() {
             commands::open_debug_log,
             commands::ocr_pending_editor_image,
             commands::copy_text,
+            commands::video_record_stop,
+            commands::video_record_state,
+            commands::video_record_begin,
+            commands::video_record_arm_cancel,
+            commands::video_toggle_mute,
+            commands::video_mute_state,
         ])
+        .manage(Mutex::new(VideoRecorder::new()))
         .build(tauri::generate_context!())
         .expect("error while building SnapDrop application")
         .run(|app, event| {

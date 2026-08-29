@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capabilities for the main and thumbnail windows",
-  "windows": ["main", "thumbnail", "editor"],
+  "windows": ["main", "thumbnail", "editor", "recorder_toolbar", "recorder_border"],
   "permissions": [
     "core:default",
     "core:event:default",

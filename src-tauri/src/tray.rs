@@ -4,7 +4,7 @@ use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::AppHandle;
 
-use crate::{commands, history, hotkey, thumbnail};
+use crate::{commands, history, hotkey, thumbnail, video_recording};
 
 pub fn init(app: &AppHandle) -> tauri::Result<()> {
     let menu = build_menu(app)?;
@@ -60,36 +60,37 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let recent = Submenu::with_items(app, "Recent Captures", true, &recent_refs)?;
 
     let pause_label = if paused { "Resume Hotkey" } else { "Pause Hotkey" };
+    let recording = video_recording::is_recording_active();
     let settings_shortcut = hotkey::current(app)
         .map(|s| hotkey::shortcut_to_string(&s))
         .unwrap_or_else(|| "Ctrl+Shift+4".to_string());
 
-    let menu = Menu::with_items(
-        app,
-        &[
-            &MenuItem::with_id(
-                app,
-                "capture",
-                "Capture Region",
-                true,
-                Some(&settings_shortcut),
-            )?,
-            &MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?,
-            &recent,
-            &MenuItem::with_id(
-                app,
-                "open_folder",
-                "Open Screenshot Folder",
-                true,
-                None::<&str>,
-            )?,
-            &MenuItem::with_id(app, "pause", pause_label, true, None::<&str>)?,
-            &PredefinedMenuItem::separator(app)?,
-            &MenuItem::with_id(app, "about", "About SnapDrop", true, None::<&str>)?,
-            &PredefinedMenuItem::separator(app)?,
-            &MenuItem::with_id(app, "exit", "Exit", true, None::<&str>)?,
-        ],
-    )?;
+    let capture_item =
+        MenuItem::with_id(app, "capture", "Capture Region", true, Some(&settings_shortcut))?;
+    let settings_item = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
+    let open_folder_item =
+        MenuItem::with_id(app, "open_folder", "Open Screenshot Folder", true, None::<&str>)?;
+    let pause_item = MenuItem::with_id(app, "pause", pause_label, true, None::<&str>)?;
+    let about_item = MenuItem::with_id(app, "about", "About SnapDrop", true, None::<&str>)?;
+    let exit_item = MenuItem::with_id(app, "exit", "Exit", true, None::<&str>)?;
+    let stop_item = MenuItem::with_id(app, "video_stop", "Stop Recording", true, None::<&str>)?;
+    let sep = PredefinedMenuItem::separator(app)?;
+
+    let mut menu_items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![
+        &capture_item,
+        &settings_item,
+        &recent,
+        &open_folder_item,
+    ];
+    if recording {
+        menu_items.push(&stop_item);
+    }
+    menu_items.push(&pause_item);
+    menu_items.push(&sep);
+    menu_items.push(&about_item);
+    menu_items.push(&sep);
+    menu_items.push(&exit_item);
+    let menu = Menu::with_items(app, &menu_items)?;
     Ok(menu)
 }
 
@@ -107,6 +108,15 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
         "capture" => hotkey::trigger_capture(app),
         "settings" => {
             let _ = commands::show_settings_inner(app);
+        }
+        "video_stop" => {
+            let app = app.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = video_recording::stop_recording(&app) {
+                    log::warn!("stop recording failed: {e}");
+                }
+                crate::tray::refresh(&app);
+            });
         }
         "open_folder" => {
             let _ = commands::open_folder_inner(app);
@@ -129,7 +139,15 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
         id if id.starts_with("recent:") => {
             if let Ok(idx) = id["recent:".len()..].parse::<usize>() {
                 if let Some(e) = history::entries(app).get(idx) {
-                    let _ = thumbnail::show_capture_for(app, &e.path);
+                    // Videos can't be shown as image thumbnails — open them in
+                    // the default player instead.
+                    if e.kind == "video"
+                        || e.path.to_ascii_lowercase().ends_with(".mp4")
+                    {
+                        let _ = commands::open_with_default_app(&e.path);
+                    } else {
+                        let _ = thumbnail::show_capture_for(app, &e.path);
+                    }
                 }
             }
         }

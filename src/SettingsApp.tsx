@@ -108,6 +108,60 @@ function formatDate(iso: string): string {
   }
 }
 
+function formatDuration(secs?: number): string {
+  const s = Math.max(0, Math.floor(secs ?? 0));
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = s % 60;
+  return h > 0 ? `${pad(h)}:${pad(m)}:${pad(ss)}` : `${pad(m)}:${pad(ss)}`;
+}
+
+function isVideoEntry(item: HistoryEntry): boolean {
+  if (item.kind === "video") return true;
+  return /\.(mp4|mkv|webm|avi|mov)$/i.test(item.path);
+}
+
+function PlayIcon() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+      <path d="M8 5v14l11-7z" />
+    </svg>
+  );
+}
+
+/**
+ * Thumbnail for a history entry. Videos get a real frame (when the preview is
+ * available) with a play badge + duration overlay on top; without a preview
+ * they fall back to the dark placeholder card. Images render as-is.
+ */
+function PreviewThumb({
+  item,
+  preview,
+  className,
+}: {
+  item: HistoryEntry;
+  preview?: string;
+  className?: string;
+}) {
+  if (isVideoEntry(item)) {
+    return (
+      <div className={`video-thumb ${className ?? ""}`}>
+        {preview ? (
+          <img src={preview} alt={fileName(item.path)} className={`${className ?? ""} video-frame`} />
+        ) : null}
+        <span className="video-play-badge">
+          <PlayIcon />
+        </span>
+      </div>
+    );
+  }
+  if (preview) {
+    return <img src={preview} alt={fileName(item.path)} className={className} />;
+  }
+  return <span className="screenshot-thumb-placeholder">PNG</span>;
+}
+
 function isToday(iso: string): boolean {
   if (!iso) return false;
   try {
@@ -221,6 +275,14 @@ export default function SettingsApp() {
           api
             .getCapturePreview(entry.path)
             .then((preview) => {
+              // An empty result means the preview couldn't be built (e.g. a
+              // video's shell thumbnail raced file finalization). Treat it like
+              // an error so this path is retried on the next refresh instead of
+              // being marked fetched against a blank frame forever.
+              if (!preview) {
+                fetchedPreviews.current.delete(entry.path);
+                return;
+              }
               setPreviews((prev) => {
                 if (prev[entry.path] === preview) return prev;
                 return { ...prev, [entry.path]: preview };
@@ -670,15 +732,11 @@ export default function SettingsApp() {
                                   </svg>
                                 </span>
                               )}
-                              {previews[item.path] ? (
-                                <img
-                                  src={previews[item.path]}
-                                  alt={fileName(item.path)}
-                                  className="screenshot-thumb-img"
-                                />
-                              ) : (
-                                <span className="screenshot-thumb-placeholder">PNG</span>
-                              )}
+                              <PreviewThumb
+                                item={item}
+                                preview={previews[item.path]}
+                                className="screenshot-thumb-img"
+                              />
                             </div>
 
                             <div className="screenshot-main-info">
@@ -688,7 +746,11 @@ export default function SettingsApp() {
 
                             <div className="screenshot-meta">
                               <span className="meta-resolution">
-                                {item.width && item.height ? `${item.width}×${item.height}` : "—"}
+                                {isVideoEntry(item)
+                                  ? formatDuration(item.duration_secs)
+                                  : item.width && item.height
+                                    ? `${item.width}×${item.height}`
+                                    : "—"}
                               </span>
                               <span className="meta-size">{formatBytes(item.size_bytes)}</span>
                             </div>
@@ -791,15 +853,11 @@ export default function SettingsApp() {
                                   </svg>
                                 </span>
                               )}
-                              {previews[item.path] ? (
-                                <img
-                                  src={previews[item.path]}
-                                  alt={fileName(item.path)}
-                                  className="screenshot-thumb-img"
-                                />
-                              ) : (
-                                <span className="screenshot-thumb-placeholder">PNG</span>
-                              )}
+                              <PreviewThumb
+                                item={item}
+                                preview={previews[item.path]}
+                                className="screenshot-thumb-img"
+                              />
                             </div>
 
                             <div className="screenshot-main-info">
@@ -809,7 +867,11 @@ export default function SettingsApp() {
 
                             <div className="screenshot-meta">
                               <span className="meta-resolution">
-                                {item.width && item.height ? `${item.width}×${item.height}` : "—"}
+                                {isVideoEntry(item)
+                                  ? formatDuration(item.duration_secs)
+                                  : item.width && item.height
+                                    ? `${item.width}×${item.height}`
+                                    : "—"}
                               </span>
                               <span className="meta-size">{formatBytes(item.size_bytes)}</span>
                             </div>
@@ -908,15 +970,11 @@ export default function SettingsApp() {
                             </svg>
                           </span>
                         )}
-                        {previews[item.path] ? (
-                          <img
-                            src={previews[item.path]}
-                            alt={fileName(item.path)}
-                            className="card-preview-img"
-                          />
-                        ) : (
-                          <span className="screenshot-thumb-placeholder">PNG Preview</span>
-                        )}
+                        <PreviewThumb
+                          item={item}
+                          preview={previews[item.path]}
+                          className="card-preview-img"
+                        />
                         <div
                           className="card-overlay"
                           onMouseDown={(e) => {
@@ -958,7 +1016,13 @@ export default function SettingsApp() {
                           {fileName(item.path)}
                         </span>
                         <div className="card-meta-row">
-                          <span>{item.width && item.height ? `${item.width}×${item.height}` : "PNG"}</span>
+                          <span>
+                            {isVideoEntry(item)
+                              ? formatDuration(item.duration_secs)
+                              : item.width && item.height
+                                ? `${item.width}×${item.height}`
+                                : "PNG"}
+                          </span>
                           <span>{formatBytes(item.size_bytes)}</span>
                         </div>
                       </div>
@@ -1034,6 +1098,14 @@ export default function SettingsApp() {
                     <span className="field-hint">Re-opens the selection on the last captured area — click to capture instantly, drag to move or resize.</span>
                     <div style={{ marginTop: 6 }}>
                       <HotkeyField value={settings.last_area_hotkey} onChange={(v) => set({ last_area_hotkey: v })} />
+                    </div>
+                  </div>
+
+                  <div className="field">
+                    <span className="field-label">Video Recording Hotkey</span>
+                    <span className="field-hint">Select a region on screen and start recording it to MP4 immediately. Stop via the tray icon.</span>
+                    <div style={{ marginTop: 6 }}>
+                      <HotkeyField value={settings.video_hotkey} onChange={(v) => set({ video_hotkey: v })} />
                     </div>
                   </div>
 
@@ -1121,6 +1193,14 @@ export default function SettingsApp() {
                     <div className="shortcut-item">
                       <span className="shortcut-label">Re-capture the last area (click the box to capture instantly)</span>
                       <kbd className="shortcut-keys">{settings.last_area_hotkey || "Ctrl+Alt+4"}</kbd>
+                    </div>
+                    <div className="shortcut-item">
+                      <span className="shortcut-label">Select a region for video recording (toolbar: Rec to start)</span>
+                      <kbd className="shortcut-keys">{settings.video_hotkey || "Ctrl+Alt+V"}</kbd>
+                    </div>
+                    <div className="shortcut-item">
+                      <span className="shortcut-label">Stop video recording (while recording)</span>
+                      <kbd className="shortcut-keys">Toolbar Stop or Tray</kbd>
                     </div>
                     <div className="shortcut-item">
                       <span className="shortcut-label">Dismiss floating thumbnail or cancel</span>

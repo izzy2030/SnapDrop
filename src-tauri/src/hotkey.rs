@@ -21,6 +21,8 @@ pub struct CurrentOcrShortcut(pub Mutex<Option<Shortcut>>);
 
 pub struct CurrentLastAreaShortcut(pub Mutex<Option<Shortcut>>);
 
+pub struct CurrentVideoShortcut(pub Mutex<Option<Shortcut>>);
+
 pub fn current(app: &AppHandle) -> Option<Shortcut> {
     app.try_state::<CurrentShortcut>()
         .and_then(|s| s.inner().0.lock().unwrap().clone())
@@ -33,6 +35,11 @@ pub fn current_ocr(app: &AppHandle) -> Option<Shortcut> {
 
 pub fn current_last_area(app: &AppHandle) -> Option<Shortcut> {
     app.try_state::<CurrentLastAreaShortcut>()
+        .and_then(|s| s.inner().0.lock().unwrap().clone())
+}
+
+pub fn current_video(app: &AppHandle) -> Option<Shortcut> {
+    app.try_state::<CurrentVideoShortcut>()
         .and_then(|s| s.inner().0.lock().unwrap().clone())
 }
 
@@ -109,6 +116,31 @@ pub fn init(app: &AppHandle) {
     // Esc dismisses the floating thumbnail (registered once; acts only while
     // the thumbnail is visible).
     register_esc_hotkey(app);
+}
+
+/// Video-recording hotkey (Ctrl+Alt+V): select a region on screen and start
+/// recording it to an MP4 immediately.
+pub fn init_video_hotkey(app: &AppHandle) {
+    let settings = settings::get(app);
+    let video_shortcut = match parse_shortcut(&settings.video_hotkey) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("invalid video hotkey in settings: {e}; using default");
+            Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyV)
+        }
+    };
+    app.manage(CurrentVideoShortcut(Mutex::new(Some(video_shortcut.clone()))));
+    match app.global_shortcut().on_shortcut(video_shortcut.clone(), |app, _sc, event| {
+        if event.state() == ShortcutState::Pressed {
+            trigger_capture_video(app);
+        }
+    }) {
+        Ok(()) => log::info!(
+            "video hotkey registered: {}",
+            shortcut_to_string(&video_shortcut)
+        ),
+        Err(e) => log::warn!("video hotkey registration failed (conflict?): {e}"),
+    }
 }
 
 /// Request a capture. Runs the full flow on the main thread with a reentrancy guard.
@@ -234,13 +266,40 @@ pub fn pause(app: &AppHandle, paused: bool) {
     let sc = current(app);
     let osc = current_ocr(app);
     let lac = current_last_area(app);
+    let vc = current_video(app);
     if paused {
-        for s in [sc, osc, lac].into_iter().flatten() {
+        for s in [sc, osc, lac, vc].into_iter().flatten() {
             let _ = app.global_shortcut().unregister(s);
         }
     } else {
-        for s in [sc, osc, lac].into_iter().flatten() {
+        for s in [sc, osc, lac, vc].into_iter().flatten() {
             let _ = app.global_shortcut().register(s);
+        }
+    }
+}
+
+/// Re-register the video hotkey from settings. Returns Err on conflict.
+pub fn apply_video_settings(app: &AppHandle, hotkey_str: &str) -> Result<(), String> {
+    let shortcut = parse_shortcut(hotkey_str)?;
+    let old = current_video(app);
+
+    if let Some(o) = &old {
+        let _ = app.global_shortcut().unregister(o.clone());
+    }
+
+    match app.global_shortcut().register(shortcut.clone()) {
+        Ok(()) => {
+            if let Some(state) = app.try_state::<CurrentVideoShortcut>() {
+                *state.inner().0.lock().unwrap() = Some(shortcut);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // Re-register the old one so the app stays usable.
+            if let Some(o) = &old {
+                let _ = app.global_shortcut().register(o.clone());
+            }
+            Err(format!("Could not register {hotkey_str}: {e}"))
         }
     }
 }
@@ -266,6 +325,32 @@ pub fn apply_last_area_settings(app: &AppHandle, hotkey_str: &str) -> Result<(),
             Err(format!("Could not register {hotkey_str}: {e}"))
         }
     }
+}
+
+/// Video-recording variant of `trigger_capture`: same reentrancy guard and
+/// main-thread hop, but the flow selects a region and starts recording it
+/// instead of taking a screenshot.
+pub fn trigger_capture_video(app: &AppHandle) {
+    if CAPTURING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        let app3 = app2.clone();
+        let sent = app2.run_on_main_thread(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                capture_flow::run_video(&app3);
+            }));
+            if let Err(payload) = result {
+                log::error!("video capture flow panicked: {}", crate::panic_message(&payload));
+                let _ = notifier::toast(&app3, "error", "Video capture failed unexpectedly");
+            }
+            CAPTURING.store(false, Ordering::SeqCst);
+        });
+        if sent.is_err() {
+            CAPTURING.store(false, Ordering::SeqCst);
+        }
+    });
 }
 
 /// Re-register the OCR hotkey from settings. Returns Err on conflict.
