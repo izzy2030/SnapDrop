@@ -267,6 +267,8 @@ pub fn run() {
             commands::video_record_arm_cancel,
             commands::video_toggle_mute,
             commands::video_mute_state,
+            commands::video_toggle_pause,
+            commands::video_pause_state,
         ])
         .manage(Mutex::new(VideoRecorder::new()))
         .build(tauri::generate_context!())

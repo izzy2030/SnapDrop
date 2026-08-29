@@ -42,6 +42,8 @@ pub struct Settings {
     /// Global hotkey: select a region on screen and start video-recording it
     /// (Ctrl+Alt+V by default).
     pub video_hotkey: String,
+    /// Capture rate for video recording (frames per second).
+    pub video_fps: u32,
     /// The most recently captured region (virtual-screen coords). Seeded by
     /// every image capture; None until the first screenshot.
     pub last_area: Option<LastArea>,
@@ -59,7 +61,7 @@ pub struct LastArea {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            hotkey: "Ctrl+Shift+4".into(),
+            hotkey: "Ctrl+Alt+S".into(),
             screenshot_dir: filename::default_screenshot_dir().to_string_lossy().to_string(),
             format: "png".into(),
             start_with_windows: true,
@@ -74,12 +76,19 @@ impl Default for Settings {
             max_history: 10,
             confirm_delete: false,
             close_to_tray: true,
-            ocr_hotkey: "Ctrl+Shift+5".into(),
+            ocr_hotkey: "Ctrl+Alt+O".into(),
             // Duration of the delayed capture, armed by holding Shift while
             // selecting. 0 = Shift does nothing (instant capture).
             capture_delay_secs: 3,
-            last_area_hotkey: "Ctrl+Alt+4".into(),
+            last_area_hotkey: "Ctrl+Alt+L".into(),
             video_hotkey: "Ctrl+Alt+V".into(),
+            // 30fps: the Media Foundation H.264 encoder sustains ~30fps
+            // real-time on this system regardless of the requested rate
+            // (measured 28–30 fps at both 30 and 60 requests), so 60 only
+            // wastes CPU and, with CFR timestamps at 33ms spacing, declares a
+            // rate the encoder can't feed. 60 remains selectable in Settings
+            // for machines/regions that can sustain it.
+            video_fps: 30,
             last_area: None,
         }
     }
@@ -157,12 +166,12 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let s = Settings::default();
-        assert_eq!(s.hotkey, "Ctrl+Shift+4");
+        assert_eq!(s.hotkey, "Ctrl+Alt+S");
         assert!(s.screenshot_dir.contains("Pictures"));
         assert_eq!(s.max_history, 10);
         assert!(s.copy_to_clipboard);
         assert!(s.start_with_windows);
-        assert_eq!(s.last_area_hotkey, "Ctrl+Alt+4");
+        assert_eq!(s.last_area_hotkey, "Ctrl+Alt+L");
         assert_eq!(s.video_hotkey, "Ctrl+Alt+V");
         assert!(s.last_area.is_none());
     }
@@ -182,7 +191,7 @@ mod tests {
         // Old settings files without the field default to None.
         let partial = serde_json::from_str::<Settings>("{}").unwrap();
         assert!(partial.last_area.is_none());
-        assert_eq!(partial.last_area_hotkey, "Ctrl+Alt+4");
+        assert_eq!(partial.last_area_hotkey, "Ctrl+Alt+L");
         assert_eq!(partial.video_hotkey, "Ctrl+Alt+V");
     }
 
@@ -194,6 +203,6 @@ mod tests {
         assert_eq!(back.hotkey, s.hotkey);
         // Missing fields fall back to defaults.
         let partial = serde_json::from_str::<Settings>("{}").unwrap();
-        assert_eq!(partial.hotkey, "Ctrl+Shift+4");
+        assert_eq!(partial.hotkey, "Ctrl+Alt+S");
     }
 }

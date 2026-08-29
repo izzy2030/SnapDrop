@@ -63,7 +63,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let recording = video_recording::is_recording_active();
     let settings_shortcut = hotkey::current(app)
         .map(|s| hotkey::shortcut_to_string(&s))
-        .unwrap_or_else(|| "Ctrl+Shift+4".to_string());
+        .unwrap_or_else(|| "Ctrl+Alt+S".to_string());
 
     let capture_item =
         MenuItem::with_id(app, "capture", "Capture Region", true, Some(&settings_shortcut))?;

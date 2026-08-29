@@ -8,6 +8,7 @@ import "./styles.css";
 interface RecorderState {
   recording: boolean;
   muted: boolean;
+  paused: boolean;
 }
 
 function SpeakerIcon() {
@@ -41,6 +42,23 @@ function StopIcon() {
   return <span className="stop-square" />;
 }
 
+function PauseIcon({ paused }: { paused: boolean }) {
+  // While paused show a "play" (resume) glyph; while recording show pause bars.
+  if (paused) {
+    return (
+      <svg width="13" height="13" viewBox="0 0 12 12" fill="none" aria-hidden>
+        <path d="M3 1.5v9l7.5-4.5L3 1.5z" fill="currentColor" />
+      </svg>
+    );
+  }
+  return (
+    <svg width="13" height="13" viewBox="0 0 12 12" fill="none" aria-hidden>
+      <rect x="2" y="1.5" width="2.8" height="9" rx="1" fill="currentColor" />
+      <rect x="7.2" y="1.5" width="2.8" height="9" rx="1" fill="currentColor" />
+    </svg>
+  );
+}
+
 function CloseIcon() {
   return (
     <svg width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden>
@@ -52,31 +70,67 @@ function CloseIcon() {
 function RecorderToolbar() {
   const [recording, setRecording] = useState(false);
   const [muted, setMuted] = useState(false);
+  const [paused, setPaused] = useState(false);
   const [elapsed, setElapsed] = useState(0);
 
   const recordingRef = useRef(false);
   const mutedRef = useRef(false);
+  const pausedRef = useRef(false);
+  // Elapsed accumulated before the current running segment; the ticker shows
+  // baseMs + (now - startRef), so pausing can freeze the running segment and
+  // resuming starts a fresh one without losing time.
+  const baseMsRef = useRef(0);
   const startRef = useRef(0);
   const timerRef = useRef<number | undefined>(undefined);
 
+  const stopTimer = () => {
+    if (timerRef.current !== undefined) {
+      clearInterval(timerRef.current);
+      timerRef.current = undefined;
+    }
+  };
+
+  const startTimer = () => {
+    if (timerRef.current !== undefined) return;
+    timerRef.current = window.setInterval(() => {
+      setElapsed(Math.floor((baseMsRef.current + (Date.now() - startRef.current)) / 1000));
+    }, 250);
+  };
+
   // Apply a state snapshot: flips the UI mode and drives the elapsed ticker.
+  // Handles fresh-start, pause, and resume transitions for the timer.
   const applyState = (s: RecorderState) => {
     recordingRef.current = s.recording;
     mutedRef.current = s.muted;
     setRecording(s.recording);
     setMuted(s.muted);
+    setPaused(s.paused);
+
     if (s.recording) {
-      if (timerRef.current === undefined) {
-        startRef.current = Date.now();
-        setElapsed(0);
-        timerRef.current = window.setInterval(
-          () => setElapsed(Math.floor((Date.now() - startRef.current) / 1000)),
-          250,
-        );
+      if (s.paused) {
+        // Paused: freeze the running segment if we weren't already paused.
+        if (!pausedRef.current && timerRef.current !== undefined) {
+          baseMsRef.current += Date.now() - startRef.current;
+          startRef.current = Date.now();
+          setElapsed(Math.floor(baseMsRef.current / 1000));
+        }
+        pausedRef.current = true;
+        stopTimer();
+      } else {
+        // Running. Distinguish a fresh recording start from a resume.
+        if (pausedRef.current) {
+          startRef.current = Date.now();
+          pausedRef.current = false;
+        } else if (timerRef.current === undefined) {
+          baseMsRef.current = 0;
+          startRef.current = Date.now();
+          setElapsed(0);
+        }
+        startTimer();
       }
-    } else if (timerRef.current !== undefined) {
-      clearInterval(timerRef.current);
-      timerRef.current = undefined;
+    } else {
+      pausedRef.current = false;
+      stopTimer();
       setElapsed(0);
     }
   };
@@ -88,7 +142,9 @@ function RecorderToolbar() {
     invoke<boolean>("video_record_state")
       .then((rec) =>
         invoke<boolean>("video_mute_state").then((m) =>
-          applyState({ recording: rec, muted: m }),
+          invoke<boolean>("video_pause_state").then((p) =>
+            applyState({ recording: rec, muted: m, paused: p }),
+          ),
         ),
       )
       .catch((e) => {
@@ -103,7 +159,7 @@ function RecorderToolbar() {
       invoke<boolean>("video_record_state")
         .then((rec) => {
           if (rec !== recordingRef.current) {
-            applyState({ recording: rec, muted: mutedRef.current });
+            applyState({ recording: rec, muted: mutedRef.current, paused: pausedRef.current });
           }
         })
         .catch((e) => {
@@ -146,6 +202,22 @@ function RecorderToolbar() {
               {muted ? <SpeakerOffIcon /> : <SpeakerIcon />}
             </button>
             <button
+              className={`rec-btn pause${paused ? " active" : ""}`}
+              title={paused ? "Resume recording" : "Pause recording"}
+              onClick={async () => {
+                try {
+                  const p = await invoke<boolean>("video_toggle_pause");
+                  pausedRef.current = p;
+                  setPaused(p);
+                  applyState({ recording: true, muted: mutedRef.current, paused: p });
+                } catch (e) {
+                  void api.debugLog(`recorder: pause toggle failed: ${e}`);
+                }
+              }}
+            >
+              <PauseIcon paused={paused} />
+            </button>
+            <button
               className="rec-btn stop"
               title="Stop recording"
               onClick={() => {
@@ -169,7 +241,6 @@ function RecorderToolbar() {
               }}
             >
               <RecIcon />
-              <span>Rec</span>
             </button>
             <span className="rec-sep" />
             <button

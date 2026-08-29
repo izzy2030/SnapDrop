@@ -43,6 +43,16 @@ pub fn is_recording_active() -> bool {
     ACTIVE.load(Ordering::SeqCst)
 }
 
+/// Target encode bitrate for a region, in bits/second. High bitrate makes the
+/// encoder fall behind real-time and drop frames (see `new`), so scale it to
+/// the actual pixels and frame rate instead of the crate's 15 Mbps blanket
+/// default. ~0.1 bit/pixel/frame is a strong quality bound; clamp to a sane
+/// 1.5–20 Mbps so tiny and huge regions both stay reasonable.
+pub fn video_bitrate_bps(w: u32, h: u32, fps: u32) -> u32 {
+    let raw = (w as u64) * (h as u64) * (fps as u64) / 10; // 0.1 bit/pixel/frame
+    raw.clamp(1_500_000, 20_000_000) as u32
+}
+
 /// Flags threaded into the handler via `Settings`. Must be `Send`; it uses
 /// plain `RECT`s (never the non-`Send` `HMONITOR`) plus the output path as a
 /// `String` (which is `Send`). Delivered to the *capture thread* inside the
@@ -92,11 +102,30 @@ struct VideoSession {
     /// stop+finalize latency (the encoder is finaled later, on another thread).
     stop_time: Option<Instant>,
     stop_requested: Arc<AtomicBool>,
+    /// Accumulated "pause" wall-clock time. Subtracted from the running
+    /// elapsed when computing frame timestamps so the VIDEO timeline freezes
+    /// across a pause. (The audio timeline freezes naturally: while paused we
+    /// feed nothing, so the encode's audio sample counter stops advancing.)
+    /// Both freezing together keeps A/V in sync across the pause.
+    paused_accum: Duration,
+    /// True while a pause is in effect (this session's mirror of the global
+    /// toolbar pause flag, with its transition tracked here).
+    currently_paused: bool,
+    /// Instant the current pause began, for computing `paused_accum` on resume.
+    pause_started_at: Option<Instant>,
     /// True until the first frame is sent — used to drop the PCM that
     /// accumulated between audio start and the first video frame.
     first_frame: bool,
     /// Capture rate, used for the constant-frame-rate timestamp grid.
     fps: u32,
+    /// Reused scratch buffer for the top-down -> bottom-up row flip. Allocating
+    /// a fresh Vec per frame (~8MB at 1080p) pressures the allocator and can
+    /// cost WGC frames under load; resizing in place keeps the allocation
+    /// across frames of the same size.
+    flip_buf: Vec<u8>,
+    /// Timestamp (100ns units) of the last emitted frame, for monotonic-grid
+    /// pacing when delivery is slower than the declared frame rate.
+    last_frame_ts: i64,
     result: RecordingResult,
 }
 
@@ -118,7 +147,15 @@ impl GraphicsCaptureApiHandler for VideoSession {
         let encoder = VideoEncoder::new(
             VideoSettingsBuilder::new(w, h)
                 .sub_type(VideoSettingsSubType::H264)
-                .frame_rate(fps),
+                .frame_rate(fps)
+                // Don't trust the 15 Mbps default (geared to 1080p60+). A
+                // bitrate far above a region's needs makes the encoder work
+                // harder per frame and it falls behind real-time, so
+                // MediaStreamSource drops frames to keep up — capping the
+                // output well below the requested fps. Scale to the actual
+                // pixels and rate: ~0.1 bit/pixel/frame is a high-quality
+                // bound, clamped to a sane 1.5–20 Mbps.
+                .bitrate(video_bitrate_bps(w, h, fps)),
             // System audio is enabled; PCM is fed continuously from the WASAPI
             // loopback capture. 48 kHz / stereo / 16-bit is the encoder default
             // and matches what `audio::AudioLoopback` delivers.
@@ -143,8 +180,13 @@ impl GraphicsCaptureApiHandler for VideoSession {
             frames: 0,
             stop_time: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
+            paused_accum: Duration::ZERO,
+            currently_paused: false,
+            pause_started_at: None,
             first_frame: true,
             fps,
+            flip_buf: Vec::new(),
+            last_frame_ts: 0,
             result: RecordingResult::default(),
         })
     }
@@ -154,28 +196,47 @@ impl GraphicsCaptureApiHandler for VideoSession {
         frame: &mut Frame<'_>,
         capture_control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
-        // Constant-frame-rate timestamp grid. WGC's raw timestamps are jittery
-        // (the 33ms throttle plus capture-thread scheduling produce intervals
-        // like 33/34/67/33ms), and writing those raw times into the MP4 makes
-        // playback stutter. Re-stamp every frame to the exact grid
-        //   frame_n at n * (1s / fps)
-        // so the file has constant sample times (what players render smoothly).
-        //
-        // We only re-sync to wall-clock when we fall behind by more than a
-        // full frame (a genuine stall — GPU hiccup, encoder pinch). Then the
-        // next timestamp jumps to the grid point >= real elapsed: the motion
-        // shows a small gap (honest — frames WERE dropped) while the audio
-        // timeline (its own monotonic clock) stays aligned and the grid phase
-        // is preserved.
-        let frame_dur = 10_000_000u64 / self.fps.max(1) as u64; // 100ns ticks
-        let nominal = (self.frames as u64) * frame_dur;
-        let elapsed = self.started.elapsed().as_nanos() as u64 / 100; // to 100ns ticks
-        let ts = if nominal + frame_dur < elapsed {
-            // Behind by more than a frame: re-align to the next grid point.
-            (elapsed.div_ceil(frame_dur) * frame_dur) as i64
-        } else {
-            nominal as i64
-        };
+        // Track pause transitions from the global toolbar flag. While paused
+        // we feed the encoder NOTHING (no video frame, no audio), so both
+        // timelines stop advancing and stay in sync; on resume we subtract the
+        // paused wall-clock time so the file simply omits the paused period.
+        let pause_req = crate::toolbar::is_paused();
+        if pause_req && !self.currently_paused {
+            self.currently_paused = true;
+            self.pause_started_at = Some(Instant::now());
+        } else if !pause_req && self.currently_paused {
+            if let Some(ps) = self.pause_started_at.take() {
+                self.paused_accum += ps.elapsed();
+            }
+            self.currently_paused = false;
+        }
+        // Paused: drop this frame entirely (video + audio both frozen). Still
+        // honor a stop request so the toolbar/tray Stop works mid-pause.
+        if self.currently_paused {
+            if self.stop_requested.load(Ordering::SeqCst) {
+                capture_control.stop();
+            }
+            return Ok(());
+        }
+
+        // Constant-frame-rate timeline driven by wall-clock, not frame count.
+        // Stamp each frame at the next grid point at-or-after real elapsed
+        // time, and never closer than one frame to the previous stamp (so
+        // timestamps stay strictly increasing and even-spaced even when the
+        // delivered rate lags the declared rate). With a 60fps request that's
+        // actually encoding at ~30fps, the older "nominal count vs snap-ahead"
+        // logic emitted alternating ~16ms/~50ms gaps — read as visible jump-
+        // ing. This always lands on the grid, giving even frame intervals at
+        // whatever rate the encoder sustains; the declared fps (same setting)
+        // is the only thing that should be set to match.
+        let frame_dur = (10_000_000u64 / self.fps.max(1) as u64) as i64; // 100ns ticks
+        // Elapsed wall-clock EXCLUDING accumulated pause time, so the video
+        // timeline resumes where it paused rather than jumping forward.
+        let elapsed = ((self.started.elapsed() - self.paused_accum).as_nanos() as u64 / 100) as i64;
+        // ceil(elapsed / frame_dur) * frame_dur, without the unstable div_ceil.
+        let snapped = ((elapsed + frame_dur - 1) / frame_dur) * frame_dur;
+        let ts = snapped.max(self.last_frame_ts + frame_dur);
+        self.last_frame_ts = ts;
         // Crop to the region (rounded to even dimensions), relative to the monitor top-left.
         let ox = (self.region.left - self.monitor_rect.left).max(0) as u32;
         let oy = (self.region.top - self.monitor_rect.top).max(0) as u32;
@@ -188,16 +249,17 @@ impl GraphicsCaptureApiHandler for VideoSession {
         let row = buf.width() as usize * 4;
         // Capture is now requested as Bgra8, so no per-pixel channel swap is
         // needed. We only flip rows top-down -> bottom-to-top (which Windows /
-        // MF expect). ImageMemReader returns a wrapper that lets us iterate
-        // without re-owning every byte; flip in place with a row-by-row swap.
-        let mut flipped = vec![0u8; bgra.len()];
+        // MF expect). Reuse the session's scratch buffer (resize in place)
+        // instead of allocating per frame.
+        self.flip_buf.resize(bgra.len(), 0);
         for y in 0..h as usize {
             let src = &bgra[y * row..(y + 1) * row];
             let dst_row = (h as usize - 1 - y) * row;
-            flipped[dst_row..dst_row + row].copy_from_slice(src);
+            self.flip_buf[dst_row..dst_row + row].copy_from_slice(src);
         }
+        let flipped = &self.flip_buf[..];
         if let Some(enc) = self.encoder.as_mut() {
-            enc.send_frame_buffer(&flipped, ts)?;
+            enc.send_frame_buffer(flipped, ts)?;
             self.frames += 1;
             // Feed whatever system audio accumulated since the last frame.
             // When muted, send silence of the same length so the audio
@@ -273,10 +335,12 @@ impl VideoSession {
             self.result = RecordingResult {
                 path: self.output_path.clone(),
                 frames: self.frames,
+                // Exclude paused wall-clock time so the reported duration
+                // reflects the actual recording (the file omits the pause).
                 elapsed_ms: self
                 .stop_time
-                .map(|t| t.duration_since(self.started).as_millis())
-                .unwrap_or_else(|| self.started.elapsed().as_millis()),
+                .map(|t| (t.duration_since(self.started) - self.paused_accum).as_millis())
+                .unwrap_or_else(|| (self.started.elapsed() - self.paused_accum).as_millis()),
                 width: self.enc_w,
                 height: self.enc_h,
             };

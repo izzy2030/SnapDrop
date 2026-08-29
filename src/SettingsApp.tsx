@@ -452,7 +452,7 @@ export default function SettingsApp() {
               </svg>
               <span>Screenshot</span>
             </div>
-            <span className="hero-shortcut">{settings.hotkey || "Ctrl+Shift+4"}</span>
+            <span className="hero-shortcut">{settings.hotkey || "Ctrl+Alt+S"}</span>
           </button>
         </div>
 
@@ -703,7 +703,7 @@ export default function SettingsApp() {
                     <polyline points="21 15 16 10 5 21"/>
                   </svg>
                   <h3>No Screenshots Found</h3>
-                  <p>Capture your first screenshot by pressing {settings.hotkey || "Ctrl+Shift+4"} or clicking Screenshot in the sidebar.</p>
+                  <p>Capture your first screenshot by pressing {settings.hotkey || "Ctrl+Alt+S"} or clicking Screenshot in the sidebar.</p>
                   <button type="button" className="primary" onClick={() => api.captureNow()}>
                     Capture Now
                   </button>
@@ -1110,6 +1110,19 @@ export default function SettingsApp() {
                   </div>
 
                   <div className="field">
+                    <span className="field-label">Video Frame Rate</span>
+                    <span className="field-hint">Frames per second. 60 is smoother for fast motion (video, scrolling); 30 uses less CPU and makes smaller files.</span>
+                    <select
+                      style={{ marginTop: 6 }}
+                      value={String(settings.video_fps ?? 60)}
+                      onChange={(e) => set({ video_fps: Number(e.target.value) })}
+                    >
+                      <option value="30">30 fps</option>
+                      <option value="60">60 fps</option>
+                    </select>
+                  </div>
+
+                  <div className="field">
                     <span className="field-label">Screenshot Directory</span>
                     <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
                       <input
@@ -1176,11 +1189,11 @@ export default function SettingsApp() {
                   <div className="shortcut-list">
                     <div className="shortcut-item">
                       <span className="shortcut-label">Capture screenshot</span>
-                      <kbd className="shortcut-keys">{settings.hotkey || "Ctrl+Shift+4"}</kbd>
+                      <kbd className="shortcut-keys">{settings.hotkey || "Ctrl+Alt+S"}</kbd>
                     </div>
                     <div className="shortcut-item">
                       <span className="shortcut-label">Capture text to clipboard (OCR)</span>
-                      <kbd className="shortcut-keys">{settings.ocr_hotkey || "Ctrl+Shift+5"}</kbd>
+                      <kbd className="shortcut-keys">{settings.ocr_hotkey || "Ctrl+Alt+O"}</kbd>
                     </div>
                     <div className="shortcut-item">
                       <span className="shortcut-label">While selecting: flip annotation editor</span>
@@ -1192,7 +1205,7 @@ export default function SettingsApp() {
                     </div>
                     <div className="shortcut-item">
                       <span className="shortcut-label">Re-capture the last area (click the box to capture instantly)</span>
-                      <kbd className="shortcut-keys">{settings.last_area_hotkey || "Ctrl+Alt+4"}</kbd>
+                      <kbd className="shortcut-keys">{settings.last_area_hotkey || "Ctrl+Alt+L"}</kbd>
                     </div>
                     <div className="shortcut-item">
                       <span className="shortcut-label">Select a region for video recording (toolbar: Rec to start)</span>

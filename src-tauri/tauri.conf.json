@@ -52,12 +52,12 @@
         "resizable": false,
         "focus": true
       },
-      {
-        "label": "recorder_toolbar",
-        "title": "SnapDrop Recorder",
-        "url": "recorder.html",
-        "width": 320,
-        "height": 54,
+    {
+      "label": "recorder_toolbar",
+      "title": "SnapDrop Recorder",
+      "url": "recorder.html",
+      "width": 360,
+      "height": 80,
         "visible": false,
         "decorations": false,
         "transparent": true,

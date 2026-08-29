@@ -1310,34 +1310,40 @@ body:has(.recorder-bar) {
 }
 
 .recorder-bar {
+  box-sizing: border-box;
   display: flex;
   align-items: center;
-  gap: 10px;
-  height: 46px;
-  padding: 0 12px;
-  background: rgba(24, 28, 34, 0.94);
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  border-radius: 12px;
-  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+  gap: 12px;
+  height: 56px;
+  padding: 0 16px;
+  background: rgba(20, 22, 27, 0.85);
+  backdrop-filter: blur(18px) saturate(1.4);
+  -webkit-backdrop-filter: blur(18px) saturate(1.4);
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: 18px;
+  box-shadow:
+    0 12px 40px rgba(0, 0, 0, 0.5),
+    inset 0 1px 0 rgba(255, 255, 255, 0.09);
   user-select: none;
   font-family: inherit;
 }
 
 .rec-dot {
-  width: 10px;
-  height: 10px;
+  width: 12px;
+  height: 12px;
   border-radius: 50%;
-  background: #ff3b30;
-  box-shadow: 0 0 8px rgba(255, 59, 48, 0.9);
+  background: #ff453a;
+  box-shadow: 0 0 10px rgba(255, 69, 58, 0.9);
   animation: recBlink 1.1s ease-in-out infinite;
 }
 
+/* The dot inside the armed (not-yet-started) record button: white on red. */
 .rec-dot-large {
-  width: 10px;
-  height: 10px;
+  width: 16px;
+  height: 16px;
   border-radius: 50%;
-  background: #ff3b30;
-  box-shadow: 0 0 8px rgba(255, 59, 48, 0.9);
+  background: #fff;
+  box-shadow: 0 0 12px rgba(255, 255, 255, 0.6);
 }
 
 @keyframes recBlink {
@@ -1346,70 +1352,110 @@ body:has(.recorder-bar) {
 }
 
 .rec-time {
-  color: #f2f4f7;
+  color: #fff;
   font-size: 15px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.5px;
-  min-width: 46px;
+  min-width: 52px;
   text-align: left;
 }
 
 .rec-sep {
   width: 1px;
-  height: 22px;
-  background: rgba(255, 255, 255, 0.18);
+  height: 26px;
+  background: rgba(255, 255, 255, 0.14);
 }
 
 .rec-btn {
+  box-sizing: border-box;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 6px;
-  height: 32px;
-  min-width: 32px;
-  padding: 0 10px;
+  height: 40px;
+  min-width: 40px;
+  padding: 0 8px;
   border: none;
-  border-radius: 8px;
-  background: transparent;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.07);
   color: #dfe3ea;
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
-  transition: background 0.12s ease;
+  transition: background 0.12s ease, transform 0.12s ease;
 }
 
 .rec-btn:hover {
-  background: rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.14);
+  transform: translateY(-1px);
+}
+
+.rec-btn:active {
+  transform: translateY(0);
 }
 
 .rec-btn.muted {
-  color: #ff8a80;
+  color: #ff9f0a;
 }
 
+/* Armed record button: big red circle with a pulsing glow, sized to sit
+   INSIDE the bar (bar inner height is 56px minus 2px border = 54px). */
 .rec-btn.start {
-  background: rgba(255, 59, 48, 0.18);
-  color: #ff6b60;
-  padding: 0 16px;
+  width: 40px;
+  height: 40px;
+  min-width: 40px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #ff453a, #e02d23);
+  box-shadow:
+    0 4px 18px rgba(255, 69, 58, 0.55),
+    inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  animation: recPulse 1.6s ease-in-out infinite;
 }
 
 .rec-btn.start:hover {
-  background: rgba(255, 59, 48, 0.32);
+  background: linear-gradient(135deg, #ff5a50, #f03428);
+  transform: scale(1.06);
 }
 
+.rec-btn.start:active {
+  transform: scale(0.98);
+}
+
+@keyframes recPulse {
+  0%, 100% { box-shadow: 0 4px 18px rgba(255, 69, 58, 0.55); }
+  50% { box-shadow: 0 4px 30px rgba(255, 69, 58, 0.9); }
+}
+
+/* Stop recording: red circle with a white square (classic record/stop pair). */
 .rec-btn.stop {
-  background: #ff3b30;
-  color: #fff;
+  width: 40px;
+  height: 40px;
+  min-width: 40px;
+  border-radius: 50%;
+  background: #ff453a;
+  box-shadow: 0 4px 14px rgba(255, 69, 58, 0.5);
 }
 
 .rec-btn.stop:hover {
   background: #e02d23;
+  transform: scale(1.05);
+}
+
+/* Pause/Resume toggle: ghost by default, amber-fill while paused. */
+.rec-btn.pause.active {
+  background: rgba(255, 159, 10, 0.18);
+  color: #ffb340;
+}
+.rec-btn.pause.active:hover {
+  background: rgba(255, 159, 10, 0.3);
 }
 
 .stop-square {
-  width: 12px;
-  height: 12px;
-  border-radius: 2px;
-  background: currentColor;
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  background: #fff;
   display: inline-block;
 }
 

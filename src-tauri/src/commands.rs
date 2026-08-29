@@ -620,7 +620,9 @@ pub async fn video_record_begin(app: AppHandle) -> Result<String, String> {
         let Some(p) = pending else {
             return Err("No region selected — press Ctrl+Alt+V first".to_string());
         };
-        match crate::video_recording::start_recording(&app, p.region, p.path, 30) {
+        // Capture rate from Settings (clamped 5–60 inside start_recording).
+        let fps = crate::settings::get(&app).video_fps;
+        match crate::video_recording::start_recording(&app, p.region, p.path, fps) {
             Ok(path) => Ok(path),
             Err(e) => {
                 // Start failed (e.g. the monitor was unplugged). The pending
@@ -679,6 +681,21 @@ pub fn video_toggle_mute() -> bool {
 #[cfg(windows)]
 pub fn video_mute_state() -> bool {
     crate::toolbar::is_muted()
+}
+
+/// Flip recording pause; returns the new state (for the toolbar UI). Only
+/// meaningful while a recording is active.
+#[tauri::command]
+#[cfg(windows)]
+pub fn video_toggle_pause() -> bool {
+    crate::toolbar::toggle_pause()
+}
+
+/// Current paused state (toolbar reads it on mount / poll).
+#[tauri::command]
+#[cfg(windows)]
+pub fn video_pause_state() -> bool {
+    crate::toolbar::is_paused()
 }
 
 #[tauri::command]

@@ -20,6 +20,7 @@ export interface Settings {
   capture_delay_secs: number;
   last_area_hotkey: string;
   video_hotkey: string;
+  video_fps: number;
   last_area: { x: number; y: number; width: number; height: number } | null;
 }
 

@@ -14,8 +14,9 @@ use tauri::{AppHandle, Emitter, Manager};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE};
 
-const TOOLBAR_W: i32 = 320;
-const TOOLBAR_H: i32 = 54;
+// Must match the `recorder_toolbar` window in tauri.conf.json.
+const TOOLBAR_W: i32 = 360;
+const TOOLBAR_H: i32 = 80;
 const MARGIN: i32 = 12;
 /// Padding (physical px) around the recording region on the border window,
 /// giving the dimension pill room to sit just outside the top-left corner
@@ -27,6 +28,11 @@ const BORDER_PAD: i32 = 48;
 /// the PCM so the audio timeline stays continuous instead of dropping
 /// samples, which would break A/V sync).
 static MUTED: AtomicBool = AtomicBool::new(false);
+/// Global "recording paused" flag. Read every frame by the recorder handler
+/// (which freezes feeding the encoder so the video AND audio timelines both
+/// stop advancing — keeping A/V synced across a pause). Toggled by the
+/// toolbar's Pause/Resume button via a command.
+static PAUSED: AtomicBool = AtomicBool::new(false);
 
 pub fn is_muted() -> bool {
     MUTED.load(Ordering::SeqCst)
@@ -39,10 +45,22 @@ pub fn toggle_mute() -> bool {
     next
 }
 
+pub fn is_paused() -> bool {
+    PAUSED.load(Ordering::SeqCst)
+}
+
+/// Flip the pause flag; returns the new state (for the toolbar UI).
+pub fn toggle_pause() -> bool {
+    let next = !is_paused();
+    PAUSED.store(next, Ordering::SeqCst);
+    next
+}
+
 #[derive(Clone, Serialize)]
 pub struct RecorderState {
     pub recording: bool,
     pub muted: bool,
+    pub paused: bool,
 }
 
 /// Make the toolbar window invisible to screen-capture APIs (WGC included),
@@ -97,19 +115,22 @@ pub fn arm(app: &AppHandle, region: RECT) {
     }
     let _ = app.emit(
         "video_recorder_state",
-        RecorderState { recording: false, muted: is_muted() },
+        RecorderState { recording: false, muted: is_muted(), paused: is_paused() },
     );
 }
 
 /// Show the toolbar in recording mode (elapsed timer + mute + stop).
 pub fn show_recording(app: &AppHandle) {
+    // A fresh recording must never start already-paused (the flag can be left
+    // true if the user paused the previous take before stopping).
+    PAUSED.store(false, Ordering::SeqCst);
     apply_exclude_from_capture(app);
     if let Some(win) = app.get_webview_window("recorder_toolbar") {
         let _ = win.show();
     }
     let _ = app.emit(
         "video_recorder_state",
-        RecorderState { recording: true, muted: is_muted() },
+        RecorderState { recording: true, muted: is_muted(), paused: is_paused() },
     );
 }
 
