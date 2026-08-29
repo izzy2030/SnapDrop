@@ -62,6 +62,24 @@ Draw a region → the extracted text lands on your clipboard.
   combined action, and a language picker for machines with several
   installed OCR languages.
 
+## Screen recording → GIF/MP4 ✅ Completed
+
+Region recording from the **same selection overlay** used for screenshots.
+
+- **Shipped**: press **Ctrl+Alt+V** (configurable in Settings → Capture →
+  "Video Hotkey") and the selection overlay opens — draw a region, then a
+  floating **toolbar** (Rec / Mute / Cancel) appears. A dashed border marks
+  the live recording region. **Rec** starts recording to an MP4 in your
+  capture folder, **Mute** toggles system audio, and Stop (toolbar or tray
+  "Stop Recording") finalizes the file. Videos appear in history with real
+  frame thumbnails and open in your default player.
+- Uses Windows Graphics Capture (GPU-backed) + Media Foundation H.264
+  encoding + WASAPI loopback for system audio — all local, no cloud.
+- The toolbar and border are excluded from the capture (`WDA_EXCLUDEFROMCAPTURE`)
+  so SnapDrop never films itself.
+- Possible follow-ups: audio device picker, GIF output for chat-friendly
+  loops, pause/resume, and a mic-plus-system mix.
+
 ## Last-capture hotkeys
 
 Global shortcuts so you can re-share the previous capture without
@@ -86,11 +104,40 @@ Also included: number-key tool shortcuts (**1–7**), palette colors for all
 annotation types, and deterministic commit → repaint → export so click-placed
 annotations (labels, step badges) always make it into the saved image.
 
-## Screen recording → GIF/MP4
+---
 
-Region recording from the **same selection overlay** used for screenshots.
+## Still in the pipeline
 
-- Big differentiator; meaningful work.
-- Needs: a capture loop over the selected region, an encoder pipeline
-  (GIF for chat-friendly loops, MP4 for quality), a stop control (hotkey or
-  tray), and size-friendly frame pacing.
+### 1. Last-capture hotkeys (above) — not started
+
+The classic "re-share the previous shot" flow: re-copy, open, or re-drag
+the last capture without taking a new one.
+
+### 2. Video recording polish (partially shipped)
+
+The recorder works end-to-end, and some follow-ups are natural next steps:
+
+- **Audio device picker** — choose which output device feeds system audio
+  (or record a microphone alongside / instead of).
+- **GIF output** — chat-friendly looping clips alongside MP4.
+- **Pause/resume** — stop the timeline without finalizing the file.
+- **Recording self-delimiter** — nice-to-have: auto-stop on a timer or when
+  the monitored window closes.
+
+### 3. OCR follow-ups (partially shipped)
+
+- **OCR search over history** — Ctrl+F across every stored capture's
+  recognized text.
+- **OCR + copy combined** — save the image AND put the text on the
+  clipboard in one action.
+- **Language picker** — for machines with several OCR language packs.
+
+### 4. Multi-drag from the floating thumbnail
+
+The thumbnail stack currently drags one capture; extending it to drag
+several recent captures (like history's multi-select) in one gesture.
+
+### 5. Screen-recording self-management
+
+- **Auto-hide main window during recording** is done; next: a "stop on
+  timer" option and better memory bounds for very long recordings.

@@ -56,6 +56,9 @@ pub struct RecorderFlags {
     pub monitor_rect: RECT,
     /// Full path of the MP4 to write.
     pub output_path: String,
+    /// Capture rate (frames per second). Clamped to 5–60 in `start_recording`;
+    /// threaded through so the encoder declares the SAME rate it is fed.
+    pub fps: u32,
 }
 
 /// Outcome of a finished recording session.
@@ -92,6 +95,8 @@ struct VideoSession {
     /// True until the first frame is sent — used to drop the PCM that
     /// accumulated between audio start and the first video frame.
     first_frame: bool,
+    /// Capture rate, used for the constant-frame-rate timestamp grid.
+    fps: u32,
     result: RecordingResult,
 }
 
@@ -100,14 +105,20 @@ impl GraphicsCaptureApiHandler for VideoSession {
     type Error = RecorderError;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-        let RecorderFlags { region, monitor_rect, output_path } = ctx.flags.clone();
+        let RecorderFlags { region, monitor_rect, output_path, fps } = ctx.flags.clone();
         // Round DOWN to even; H.264/HEVC and Media Foundation require even
         // geometry. `w & !1` clears the lowest bit.
         let w = (region.right - region.left).max(2) as u32 & !1;
         let h = (region.bottom - region.top).max(2) as u32 & !1;
-        debuglog::log(&format!("video: handler new {}x{} -> {}", w, h, output_path));
+        debuglog::log(&format!("video: handler new {}x{} @{}fps -> {}", w, h, fps, output_path));
+        // Declare the SAME rate we feed. The builder's default is 60fps; if we
+        // leave it, the MP4/encoder think the stream is 60fps while we send 30
+        // frames/sec — Media Foundation paces on the declared rate and players
+        // read it, which shows up as stutter/judder in the output.
         let encoder = VideoEncoder::new(
-            VideoSettingsBuilder::new(w, h).sub_type(VideoSettingsSubType::H264),
+            VideoSettingsBuilder::new(w, h)
+                .sub_type(VideoSettingsSubType::H264)
+                .frame_rate(fps),
             // System audio is enabled; PCM is fed continuously from the WASAPI
             // loopback capture. 48 kHz / stereo / 16-bit is the encoder default
             // and matches what `audio::AudioLoopback` delivers.
@@ -133,6 +144,7 @@ impl GraphicsCaptureApiHandler for VideoSession {
             stop_time: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             first_frame: true,
+            fps,
             result: RecordingResult::default(),
         })
     }
@@ -142,8 +154,28 @@ impl GraphicsCaptureApiHandler for VideoSession {
         frame: &mut Frame<'_>,
         capture_control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
-        // Timestamp must be read before the (mutating) crop below borrows the frame.
-        let ts = frame.timestamp().map(|t| t.Duration).unwrap_or(0) as i64;
+        // Constant-frame-rate timestamp grid. WGC's raw timestamps are jittery
+        // (the 33ms throttle plus capture-thread scheduling produce intervals
+        // like 33/34/67/33ms), and writing those raw times into the MP4 makes
+        // playback stutter. Re-stamp every frame to the exact grid
+        //   frame_n at n * (1s / fps)
+        // so the file has constant sample times (what players render smoothly).
+        //
+        // We only re-sync to wall-clock when we fall behind by more than a
+        // full frame (a genuine stall — GPU hiccup, encoder pinch). Then the
+        // next timestamp jumps to the grid point >= real elapsed: the motion
+        // shows a small gap (honest — frames WERE dropped) while the audio
+        // timeline (its own monotonic clock) stays aligned and the grid phase
+        // is preserved.
+        let frame_dur = 10_000_000u64 / self.fps.max(1) as u64; // 100ns ticks
+        let nominal = (self.frames as u64) * frame_dur;
+        let elapsed = self.started.elapsed().as_nanos() as u64 / 100; // to 100ns ticks
+        let ts = if nominal + frame_dur < elapsed {
+            // Behind by more than a frame: re-align to the next grid point.
+            (elapsed.div_ceil(frame_dur) * frame_dur) as i64
+        } else {
+            nominal as i64
+        };
         // Crop to the region (rounded to even dimensions), relative to the monitor top-left.
         let ox = (self.region.left - self.monitor_rect.left).max(0) as u32;
         let oy = (self.region.top - self.monitor_rect.top).max(0) as u32;
@@ -338,7 +370,7 @@ pub fn start_recording(
     // HMONITOR is `*mut c_void`; Monitor wraps it and is `unsafe impl Send`.
     let item_monitor = Monitor::from_raw_hmonitor(monitor.hmonitor.0);
 
-    let flags = RecorderFlags { region, monitor_rect, output_path: path.clone() };
+    let flags = RecorderFlags { region, monitor_rect, output_path: path.clone(), fps };
 
     let settings = Settings::new(
         item_monitor,
