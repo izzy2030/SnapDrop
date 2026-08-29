@@ -800,6 +800,7 @@ pub fn show_settings(app: AppHandle) -> Result<(), String> {
 
 pub fn show_settings_inner(app: &AppHandle) -> Result<(), String> {
     if let Some(w) = app.get_webview_window("main") {
+        crate::debuglog::log("show_settings_inner: showing main window");
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();

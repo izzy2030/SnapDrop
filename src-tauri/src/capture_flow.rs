@@ -29,6 +29,9 @@ pub(crate) fn restore_main_window(app: &AppHandle, was_visible: bool, was_minimi
     let Some(main_win) = app.get_webview_window("main") else {
         return;
     };
+    crate::debuglog::log(&format!(
+        "restore_main_window: showing main (was_visible={was_visible}, was_minimized={was_minimized})"
+    ));
     match main_win.hwnd() {
         Ok(tauri_hwnd) => {
             let hwnd = to_hwnd(tauri_hwnd.0);

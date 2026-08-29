@@ -11,6 +11,7 @@ mod history;
 mod hotkey;
 mod monitors;
 mod native_thumb;
+mod native_win;
 mod ocr;
 mod notifier;
 mod overlay;
@@ -32,6 +33,12 @@ use tauri::{Manager, RunEvent};
 
 /// Global pause state for the capture hotkey (toggled from the tray).
 pub static PAUSED: AtomicBool = AtomicBool::new(false);
+
+/// Incremented by a tiny task that runs on the main event loop each tick.
+/// A side-thread watchdog compares it against its own copy: if the loop ever
+/// stops pumping (wedged main thread), nothing else can log it — the loop is
+/// the thing doing the logging — so this is the only way to see it happen.
+static MAIN_LOOP_HEARTBEAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Extract a human-readable message from a panic payload.
 pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -98,6 +105,52 @@ pub fn run() {
             // Watch for a frozen thumbnail renderer (e.g. after display sleep)
             // and revive it via reload + re-presentation.
             thumbnail::spawn_renderer_watchdog(app.handle().clone());
+            // Heartbeat watchdog: if the main event loop ever stops pumping
+            // (wedged main thread), close-to-tray, hotkeys, everything goes
+            // dead — and the loop itself is what logs, so it would be silent.
+            // Post a ping every 1.5s and confirm it ran; log if it doesn't.
+            {
+                let hb_app = app.handle().clone();
+                std::thread::spawn(move || {
+                    let mut missed = 0u32;
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_millis(1500));
+                        let before = MAIN_LOOP_HEARTBEAT.load(std::sync::atomic::Ordering::SeqCst);
+                        if hb_app
+                            .run_on_main_thread(|| {
+                                MAIN_LOOP_HEARTBEAT
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            })
+                            .is_err()
+                        {
+                            return; // event loop gone — app shutting down
+                        }
+                        // Give the loop a beat to run the ping; a healthy loop
+                        // pumps it in ms.
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        let now = MAIN_LOOP_HEARTBEAT.load(std::sync::atomic::Ordering::SeqCst);
+                        if now == before {
+                            missed += 1;
+                            if missed == 2 {
+                                debuglog::log(
+                                    "WARNING main event loop unresponsive (heartbeat missed; close/hotkeys may appear dead)",
+                                );
+                            } else if missed >= 3 {
+                                debuglog::log(&format!(
+                                    "WARNING main event loop still unresponsive ({missed} heartbeats missed)"
+                                ));
+                            }
+                        } else if missed >= 2 {
+                            debuglog::log(
+                                "main event loop responsive again (heartbeat recovered)",
+                            );
+                            missed = 0;
+                        } else {
+                            missed = 0;
+                        }
+                    }
+                });
+            }
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.show();
                 let _ = w.unminimize();
@@ -115,21 +168,67 @@ pub fn run() {
                     // user disabled it in Settings, in which case close exits).
                     if settings::get(window.app_handle()).close_to_tray {
                         api.prevent_close();
-                        // Defer the hide off the CloseRequested stack frame.
-                        // Calling window.hide() synchronously right after
-                        // prevent_close() is racy and frequently gets undone
-                        // (the window stays visible), which reads as "the
-                        // close button does nothing". Schedule it a moment
-                        // later so it reliably takes effect.
+                        debuglog::log("close-to-tray: X pressed, close prevented");
+                        // Hiding via tauri's Window::hide() goes through the
+                        // main-thread event loop. If the main thread is busy
+                        // (a slow debug-log disk write, a wedged hotkey/capture
+                        // task), that hide never runs and the X "does nothing".
+                        // So hide the HWND directly with ShowWindow(SW_HIDE) -
+                        // callable from any thread, no event loop required -
+                        // then verify, with fallbacks through Tauri if needed.
                         let app = window.app_handle().clone();
                         std::thread::spawn(move || {
                             std::thread::sleep(std::time::Duration::from_millis(30));
-                            let app2 = app.clone();
-                            let _ = app.run_on_main_thread(move || {
-                                if let Some(w) = app2.get_webview_window("main") {
-                                    let _ = w.hide();
+                            let mut hidden = false;
+                            // Pass 1: direct Win32 hide (independent of the
+                            // main-thread loop, which may be wedged).
+                            if let Some(w) = app.get_webview_window("main") {
+                                if let Ok(hwnd) = w.hwnd() {
+                                    unsafe {
+                                        crate::native_win::hide_window(hwnd.0 as *mut core::ffi::c_void);
+                                    }
                                 }
-                            });
+                                if !w.is_visible().unwrap_or(true) {
+                                    debuglog::log("close-to-tray: main window hidden (direct ShowWindow)");
+                                    hidden = true;
+                                }
+                            }
+                            // Pass 2: if still visible, retry via the normal
+                            // Tauri hide (works when the loop is merely busy,
+                            // not wedged).
+                            if !hidden {
+                                for attempt in 1..=3 {
+                                    let attempt_no = attempt;
+                                    let app_for_task = app.clone();
+                                    let _ = app.clone().run_on_main_thread(move || {
+                                        let Some(w) = app_for_task.get_webview_window("main") else {
+                                            return;
+                                        };
+                                        if !w.is_visible().unwrap_or(false) {
+                                            return; // already hidden
+                                        }
+                                        match w.hide() {
+                                            Ok(()) => {
+                                                if w.is_visible().unwrap_or(true) {
+                                                    debuglog::log(&format!(
+                                                        "close-to-tray: hide attempt {attempt_no} reported ok but window STILL visible"
+                                                    ));
+                                                } else {
+                                                    debuglog::log(
+                                                        "close-to-tray: main window hidden",
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => debuglog::log(&format!(
+                                                "close-to-tray: hide failed on attempt {attempt_no}: {e}"
+                                            )),
+                                        }
+                                    });
+                                    // Retry gap off the main thread; if the first
+                                    // hide stuck, a second hide is a harmless no-op.
+                                    std::thread::sleep(std::time::Duration::from_millis(80));
+                                }
+                            }
                         });
                     }
                 }
