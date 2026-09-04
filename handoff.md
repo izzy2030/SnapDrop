@@ -134,6 +134,15 @@ so the app never films itself. Border is click-through
   ... -> path`, `video: started ->`, `video: stop`, `video: added to history`).
   Also visible in-app (Settings → log viewer). Use it to see frame counts
   (`finished N frames in ...ms`) to validate fps targets.
+- **The log ROTATES, never truncates.** On each start the previous session's
+  log moves to `snapdrop-debug.prev.log` (visible via Settings → log viewer →
+  "View previous session log"). A wedged-but-alive app (black window, missing
+  thumbnail, frozen task manager) never writes `snapdrop_panic.txt` — the
+  debug log is the ONLY evidence, so never delete the `.prev` file before
+  diagnosing. Startup now also logs session context (`startup context: ...`:
+  monitors, virtual screen, DWM, autostart) and a main-window renderer-ready
+  watchdog reloads the Settings page once if it never mounts (black-window
+  self-heal, logged either way).
 - **Never reuse `MUTED`/`PAUSED` across takes.** Both globals reset when a new
   recording starts (`show_recording` stores `PAUSED=false`).
 - **Frontend state needs polling on mount.** `recorder.tsx` pulls state + uses a

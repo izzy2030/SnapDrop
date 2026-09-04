@@ -37,7 +37,7 @@ fn build_capture_preview(path: &str) -> Result<String, String> {
             for px in rgba.pixels() {
                 bgra.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
             }
-            if let Some(png) = filename::preview_png(&bgra, w, h, 256) {
+            if let Some(png) = filename::preview_png(&bgra, w, h, 640) {
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
                 return Ok(format!("data:image/png;base64,{b64}"));
             }
@@ -105,9 +105,9 @@ fn video_thumbnail_data_url(path: &str) -> Option<String> {
                 return None;
             }
         };
-        // Thumbnail-only (no icon overlay), fit within the 256 box without
+        // Thumbnail-only (no icon overlay), fit within the 640 box without
         // cropping (SIIGBF_RESIZETOFIT = 0 is the default sizing).
-        let hbm = match factory.GetImage(SIZE { cx: 256, cy: 256 }, SIIGBF_THUMBNAILONLY) {
+        let hbm = match factory.GetImage(SIZE { cx: 640, cy: 640 }, SIIGBF_THUMBNAILONLY) {
             Ok(b) => b,
             Err(e) => {
                 crate::debuglog::log(&format!("video_thumb: GetImage failed: {e}"));
@@ -160,7 +160,7 @@ fn video_thumbnail_data_url(path: &str) -> Option<String> {
         }
 
         // The DIB is BGRA, top-down — exactly what preview_png expects.
-        let png = crate::filename::preview_png(&buf, w as u32, h as u32, 256)?;
+        let png = crate::filename::preview_png(&buf, w as u32, h as u32, 640)?;
         Some(format!(
             "data:image/png;base64,{}",
             base64::engine::general_purpose::STANDARD.encode(&png)
@@ -237,8 +237,11 @@ pub fn get_history(app: AppHandle) -> Vec<history::HistoryEntry> {
 
 #[tauri::command]
 pub fn delete_capture(app: AppHandle, path: String) -> Result<(), String> {
-    if let Err(e) = fs::remove_file(&path) {
-        crate::debuglog::log(&format!("history: delete failed for {path}: {e}"));
+    let s = settings::get(&app);
+    if s.delete_files_on_remove {
+        if let Err(e) = fs::remove_file(&path) {
+            crate::debuglog::log(&format!("history: delete failed for {path}: {e}"));
+        }
     }
     history::remove(&app, &path);
     crate::tray::refresh(&app);
@@ -247,6 +250,14 @@ pub fn delete_capture(app: AppHandle, path: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn clear_history(app: AppHandle) -> Result<(), String> {
+    let s = settings::get(&app);
+    if s.delete_files_on_remove {
+        for entry in history::entries(&app) {
+            if let Err(e) = fs::remove_file(&entry.path) {
+                crate::debuglog::log(&format!("history: clear delete failed for {}: {e}", entry.path));
+            }
+        }
+    }
     history::clear(&app);
     crate::tray::refresh(&app);
     Ok(())
@@ -705,6 +716,12 @@ pub fn capture_now(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn capture_video_now(app: AppHandle) -> Result<(), String> {
+    hotkey::trigger_capture_video(&app);
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn get_capture_preview(_app: AppHandle, path: String) -> Result<String, String> {
     // Cache hit → instant, no decode. Cache misses are decoded via
     // spawn_blocking: `async` + blocking pool keeps the heavy PNG decode OFF
@@ -806,8 +823,27 @@ pub fn get_debug_log(app: AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
+pub fn get_prev_debug_log(app: AppHandle) -> Result<String, String> {
+    crate::debuglog::read_previous(&app)
+}
+
+#[tauri::command]
 pub fn open_debug_log(app: AppHandle) -> Result<(), String> {
     crate::debuglog::open(&app)
+}
+
+#[tauri::command]
+pub fn open_prev_debug_log(app: AppHandle) -> Result<(), String> {
+    crate::debuglog::open_previous(&app)
+}
+
+/// Liveness signal from the main (Settings) window's page. The page calls
+/// this once on mount; if the WebView2 renderer fails to come up (the
+/// "black window after login" symptom), the signal never arrives and the
+/// startup watchdog logs it and reloads the page once.
+#[tauri::command]
+pub fn report_main_renderer_ready() {
+    crate::note_main_renderer_ready();
 }
 
 #[tauri::command]
@@ -818,9 +854,22 @@ pub fn show_settings(app: AppHandle) -> Result<(), String> {
 pub fn show_settings_inner(app: &AppHandle) -> Result<(), String> {
     if let Some(w) = app.get_webview_window("main") {
         crate::debuglog::log("show_settings_inner: showing main window");
+        if let Ok(hwnd) = w.hwnd() {
+            unsafe {
+                crate::native_win::show_window_foreground(hwnd.0 as *mut core::ffi::c_void);
+            }
+        }
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
+
+        // If the renderer has not reported a heartbeat within the last 10s
+        // (e.g. across power/display sleep or long idle in tray), reload it so
+        // the user never sees a solid white or unresponsive screen.
+        if crate::is_main_renderer_stale() {
+            crate::debuglog::log("show_settings_inner: main renderer is stale (>10s) — reloading webview");
+            let _ = w.reload();
+        }
     }
     Ok(())
 }

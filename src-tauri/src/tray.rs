@@ -20,15 +20,21 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(handle_menu_event)
         .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                // Left click opens Settings.
-                let app = tray.app_handle();
-                let _ = commands::show_settings_inner(app);
+            match event {
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                }
+                | TrayIconEvent::DoubleClick {
+                    button: MouseButton::Left,
+                    ..
+                } => {
+                    // Left click or double-click opens Settings.
+                    let app = tray.app_handle();
+                    let _ = commands::show_settings_inner(app);
+                }
+                _ => {}
             }
         })
         .build(app)?;

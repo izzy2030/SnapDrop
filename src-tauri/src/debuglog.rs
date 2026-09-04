@@ -2,8 +2,11 @@
 //!
 //! Writes timestamped lines to `snapdrop-debug.log` inside the app config
 //! directory. Used to diagnose environment-specific failures (stale thumbnail,
-//! missed events) that only reproduce on the user's machine; the log file is
-//! truncated to a bounded size on each app start.
+//! missed events) that only reproduce on the user's machine. Each app start
+//! ROTATES the previous run's file to `snapdrop-debug.prev.log` instead of
+//! truncating it: a wedged (not crashed) session produces no panic file, so
+//! the debug log is the only evidence — it must survive the relaunch that
+//! usually follows a hang.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -28,14 +31,24 @@ pub fn wall_clock() -> String {
     format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
 }
 
-/// Point the logger at the app config dir (called once at startup). Truncates
-/// the previous run's log so each session starts fresh.
+/// Point the logger at the app config dir (called once at startup). The
+/// previous run's log is ROTATED to `snapdrop-debug.prev.log` instead of
+/// being truncated: the failure modes this log exists to diagnose (a wedged
+/// event loop, a dead thumbnail renderer, a black window) usually don't kill
+/// the process — the app just hangs until the user quits it — and the next
+/// launch is often how the user notices. Truncating on start therefore
+/// destroyed the exact evidence needed. The previous session now survives.
 pub fn init(app: &tauri::AppHandle) {
-    let path = app
+    let dir = app
         .path()
         .app_config_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("snapdrop-debug.log");
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let path = dir.join("snapdrop-debug.log");
+    if path.exists() {
+        let prev = dir.join("snapdrop-debug.prev.log");
+        let _ = std::fs::remove_file(&prev);
+        let _ = std::fs::rename(&path, &prev);
+    }
     let _ = OpenOptions::new().create(true).write(true).truncate(true).open(&path);
     // Drop the guard BEFORE logging: `log` re-locks this mutex, and std Mutex
     // is not reentrant — locking it twice on the same thread would deadlock
@@ -59,10 +72,36 @@ pub fn read(app: &tauri::AppHandle) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| format!("Could not read {}: {e}", path.display()))
 }
 
+/// Read the previous session's rotated log, if any.
+pub fn read_previous(app: &tauri::AppHandle) -> Result<String, String> {
+    let path = app
+        .path()
+        .app_config_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("snapdrop-debug.prev.log");
+    if !path.exists() {
+        return Err("No previous session log yet (current session is the first, or the previous file was missing).".to_string());
+    }
+    std::fs::read_to_string(&path).map_err(|e| format!("Could not read {}: {e}", path.display()))
+}
+
 pub fn open(app: &tauri::AppHandle) -> Result<(), String> {
     let path = log_path(app);
     if !path.exists() {
         let _ = OpenOptions::new().create(true).append(true).open(&path);
+    }
+    crate::commands::open_with_default_app(&path.to_string_lossy())
+}
+
+/// Open the previous session's rotated log, if any.
+pub fn open_previous(app: &tauri::AppHandle) -> Result<(), String> {
+    let path = app
+        .path()
+        .app_config_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("snapdrop-debug.prev.log");
+    if !path.exists() {
+        return Err("No previous session log yet.".to_string());
     }
     crate::commands::open_with_default_app(&path.to_string_lossy())
 }

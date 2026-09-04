@@ -211,11 +211,32 @@ pub fn is_visible() -> bool {
 fn post(cmd: Cmd) {
     let hwnd = ensure_window();
     if hwnd == 0 {
+        // Silent drop was a diagnostics blind spot: a capture would save fine
+        // while the thumbnail never appeared, with nothing in the log.
+        let name = match &cmd {
+            Cmd::Present(..) => "present",
+            Cmd::Hide => "hide",
+            Cmd::Show => "show",
+            Cmd::Open(..) => "open",
+            Cmd::Reveal(..) => "reveal",
+        };
+        crate::debuglog::log(&format!(
+            "native_thumb: {name} DROPPED — thumbnail window missing (creation failed at startup?)"
+        ));
         return;
     }
     let raw = Box::into_raw(Box::new(cmd));
     unsafe {
-        let _ = PostMessageW(Some(hwnd_from(hwnd)), WM_APP_CMD, WPARAM(0), LPARAM(raw as isize));
+        if PostMessageW(Some(hwnd_from(hwnd)), WM_APP_CMD, WPARAM(0), LPARAM(raw as isize))
+            .is_err()
+        {
+            // Free the command so it isn't leaked, and log so a dead thumbnail
+            // thread is visible instead of silently swallowing every present.
+            drop(Box::from_raw(raw));
+            crate::debuglog::log(
+                "native_thumb: PostMessageW failed — thumbnail thread unresponsive?",
+            );
+        }
     }
 }
 
@@ -241,6 +262,7 @@ fn ensure_window() -> isize {
         match rx.recv() {
             Ok(h) if h != 0 => {
                 let _ = HWND_SLOT.set(h);
+                crate::debuglog::log("native_thumb: window created");
             }
             _ => crate::debuglog::log("native_thumb: window creation failed"),
         }

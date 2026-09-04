@@ -40,6 +40,23 @@ pub unsafe fn show_no_activate(hwnd: *mut c_void) {
     }
 }
 
+/// ShowWindow with SW_SHOWNORMAL and SetForegroundWindow: shows the window directly
+/// via Win32 and activates it, bypassing any cached/stale Tao diffing state.
+pub unsafe fn show_window_foreground(hwnd: *mut c_void) {
+    if hwnd.is_null() {
+        return;
+    }
+    extern "system" {
+        fn ShowWindow(hWnd: HWND, nCmdShow: i32) -> i32;
+        fn SetForegroundWindow(hWnd: HWND) -> i32;
+    }
+    const SW_SHOWNORMAL: i32 = 1;
+    unsafe {
+        let _ = ShowWindow(hwnd as HWND, SW_SHOWNORMAL);
+        let _ = SetForegroundWindow(hwnd as HWND);
+    }
+}
+
 /// IsWindowVisible: check whether the window is currently visible. Does not
 /// touch the main-thread event loop.
 pub unsafe fn is_visible(hwnd: *mut c_void) -> bool {

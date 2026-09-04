@@ -87,6 +87,27 @@ function HotkeyField({
   );
 }
 
+function ToggleSwitch({
+  checked,
+  onChange,
+  ariaLabel,
+}: {
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  ariaLabel?: string;
+}) {
+  return (
+    <label className="switch-toggle" aria-label={ariaLabel}>
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+      />
+      <span className="switch-slider" />
+    </label>
+  );
+}
+
 function fileName(p: string) {
   return p.split(/[\\/]/).pop() ?? p;
 }
@@ -192,6 +213,7 @@ export default function SettingsApp() {
   const [version, setVersion] = useState<string>("");
   const [showMoreMenu, setShowMoreMenu] = useState(false);
   const [debugLog, setDebugLog] = useState<string | null>(null);
+  const [prevDebugLog, setPrevDebugLog] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const moreMenuRef = useRef<HTMLDivElement>(null);
   // Capture files are immutable — a path's preview only needs to be fetched
@@ -204,6 +226,32 @@ export default function SettingsApp() {
   const clearSelection = useCallback(() => {
     setSelected(new Set());
     selectionAnchor.current = null;
+  }, []);
+
+  // Tell Rust the page actually mounted: the startup watchdog uses this to
+  // detect the "black window after login" case (WebView2 renderer never came
+  // up), reloading once and logging the outcome.
+  // We also keep a periodic heartbeat every 4s while alive, so if the system
+  // sleeps for hours or suspends the renderer, Rust knows if it is alive or
+  // if it became stale upon waking.
+  useEffect(() => {
+    void api.reportMainRendererReady();
+    const interval = setInterval(() => {
+      void api.reportMainRendererReady();
+    }, 4000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Allow F5 and Ctrl+R manual refresh inside SettingsApp.
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "F5" || (e.ctrlKey && e.key.toLowerCase() === "r")) {
+        e.preventDefault();
+        window.location.reload();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
 
   useEffect(() => {
@@ -324,7 +372,13 @@ export default function SettingsApp() {
   }, [refreshHistory]);
 
   const set = (patch: Partial<Settings>) => {
-    setSettings((s) => (s ? { ...s, ...patch } : s));
+    setSettings((s) => {
+      if (!s) return s;
+      const next = { ...s, ...patch };
+      // Auto-save immediately so toggles and options take effect right away
+      void api.updateSettings(next).catch((e) => console.error("Auto-save settings failed:", e));
+      return next;
+    });
   };
 
   const save = async () => {
@@ -370,6 +424,28 @@ export default function SettingsApp() {
     filteredHistory.forEach((h, i) => m.set(h.path, i));
     return m;
   }, [filteredHistory]);
+
+  const handleDeleteCapture = async (item: HistoryEntry) => {
+    if (!settings) return;
+    const promptMsg = settings.delete_files_on_remove
+      ? `Permanently delete ${fileName(item.path)} from your computer?`
+      : `Remove ${fileName(item.path)} from SnapDrop? (File stays on disk)`;
+    if (settings.confirm_delete && !window.confirm(promptMsg)) {
+      return;
+    }
+    await api.deleteCapture(item.path);
+    setHistory((prev) => prev.filter((e) => e.path !== item.path));
+    setPreviews((prev) => {
+      const next = { ...prev };
+      delete next[item.path];
+      return next;
+    });
+    setSelected((prev) => {
+      const next = new Set(prev);
+      next.delete(item.path);
+      return next;
+    });
+  };
 
   const toggleSelect = (e: React.MouseEvent, item: HistoryEntry, idx: number) => {
     e.preventDefault();
@@ -458,6 +534,21 @@ export default function SettingsApp() {
 
         {/* Sidebar Nav Items */}
         <nav className="sidebar-nav">
+          <button
+            type="button"
+            className="nav-item nav-item-action record-action"
+            onClick={() => api.captureVideoNow()}
+            title="Record screen region"
+          >
+            <div className="nav-item-left">
+              <svg className="record-video-icon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M23 7l-7 5 7 5V7z"/>
+                <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
+              </svg>
+              <span>Record</span>
+            </div>
+            <kbd className="sidebar-shortcut-tag">{settings.video_hotkey || "Ctrl+Alt+V"}</kbd>
+          </button>
           <button
             type="button"
             className={`nav-item ${navTab === "gallery" ? "active" : ""}`}
@@ -640,9 +731,12 @@ export default function SettingsApp() {
                         disabled={history.length === 0}
                         onClick={async () => {
                           setShowMoreMenu(false);
+                          const promptMsg = settings.delete_files_on_remove
+                            ? "Permanently delete all captures from your computer?"
+                            : "Clear all capture history from SnapDrop? (Files will stay on disk)";
                           if (
                             settings.confirm_delete &&
-                            !window.confirm("Clear all capture history from SnapDrop?")
+                            !window.confirm(promptMsg)
                           ) {
                             return;
                           }
@@ -654,7 +748,7 @@ export default function SettingsApp() {
                           <polyline points="3 6 5 6 21 6"/>
                           <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
                         </svg>
-                        <span>Clear all captures</span>
+                        <span>{settings.delete_files_on_remove ? "Delete all captures" : "Clear all from app"}</span>
                       </button>
                     </div>
                   )}
@@ -724,7 +818,15 @@ export default function SettingsApp() {
                             onMouseDown={(e) => handleRowMouseDown(e, item)}
                             title="Drag to drop into another app · Ctrl+click to select multiple"
                           >
-                            <div className="screenshot-thumb-box">
+                            <div
+                              className="screenshot-thumb-box"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void api.openCapture(item.path);
+                              }}
+                              onMouseDown={(e) => e.stopPropagation()}
+                              title="Click to open"
+                            >
                               {selected.has(item.path) && (
                                 <span className="selection-check">
                                   <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round">
@@ -756,17 +858,6 @@ export default function SettingsApp() {
                             </div>
 
                             <div className="screenshot-actions" onMouseDown={(e) => e.stopPropagation()}>
-                              <button
-                                type="button"
-                                className="btn-icon"
-                                onClick={() => api.openCapture(item.path)}
-                                title="Open in image viewer"
-                              >
-                                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                  <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
-                                  <circle cx="12" cy="12" r="3"/>
-                                </svg>
-                              </button>
 
                               <button
                                 type="button"
@@ -794,30 +885,8 @@ export default function SettingsApp() {
                               <button
                                 type="button"
                                 className="btn-icon danger"
-                                onClick={async () => {
-                                  if (
-                                    settings.confirm_delete &&
-                                    !window.confirm(`Delete ${fileName(item.path)}?`)
-                                  ) {
-                                    return;
-                                  }
-                                  await api.deleteCapture(item.path);
-                                  // Update local state immediately instead of a full
-                                  // refresh (which re-fetches every preview) so
-                                  // deleting several captures in a row stays fast.
-                                  setHistory((prev) => prev.filter((e) => e.path !== item.path));
-                                  setPreviews((prev) => {
-                                    const next = { ...prev };
-                                    delete next[item.path];
-                                    return next;
-                                  });
-                                  setSelected((prev) => {
-                                    const next = new Set(prev);
-                                    next.delete(item.path);
-                                    return next;
-                                  });
-                                }}
-                                title="Delete capture"
+                                onClick={() => handleDeleteCapture(item)}
+                                title={settings?.delete_files_on_remove ? "Delete file from PC" : "Remove from SnapDrop"}
                               >
                                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                                   <polyline points="3 6 5 6 21 6"/>
@@ -845,7 +914,15 @@ export default function SettingsApp() {
                             onMouseDown={(e) => handleRowMouseDown(e, item)}
                             title="Drag to drop into another app · Ctrl+click to select multiple"
                           >
-                            <div className="screenshot-thumb-box">
+                            <div
+                              className="screenshot-thumb-box"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void api.openCapture(item.path);
+                              }}
+                              onMouseDown={(e) => e.stopPropagation()}
+                              title="Click to open"
+                            >
                               {selected.has(item.path) && (
                                 <span className="selection-check">
                                   <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round">
@@ -877,17 +954,6 @@ export default function SettingsApp() {
                             </div>
 
                             <div className="screenshot-actions" onMouseDown={(e) => e.stopPropagation()}>
-                              <button
-                                type="button"
-                                className="btn-icon"
-                                onClick={() => api.openCapture(item.path)}
-                                title="Open in image viewer"
-                              >
-                                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                  <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
-                                  <circle cx="12" cy="12" r="3"/>
-                                </svg>
-                              </button>
 
                               <button
                                 type="button"
@@ -915,30 +981,8 @@ export default function SettingsApp() {
                               <button
                                 type="button"
                                 className="btn-icon danger"
-                                onClick={async () => {
-                                  if (
-                                    settings.confirm_delete &&
-                                    !window.confirm(`Delete ${fileName(item.path)}?`)
-                                  ) {
-                                    return;
-                                  }
-                                  await api.deleteCapture(item.path);
-                                  // Update local state immediately instead of a full
-                                  // refresh (which re-fetches every preview) so
-                                  // deleting several captures in a row stays fast.
-                                  setHistory((prev) => prev.filter((e) => e.path !== item.path));
-                                  setPreviews((prev) => {
-                                    const next = { ...prev };
-                                    delete next[item.path];
-                                    return next;
-                                  });
-                                  setSelected((prev) => {
-                                    const next = new Set(prev);
-                                    next.delete(item.path);
-                                    return next;
-                                  });
-                                }}
-                                title="Delete capture"
+                                onClick={() => handleDeleteCapture(item)}
+                                title={settings?.delete_files_on_remove ? "Delete file from PC" : "Remove from SnapDrop"}
                               >
                                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                                   <polyline points="3 6 5 6 21 6"/>
@@ -1009,6 +1053,17 @@ export default function SettingsApp() {
                               <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
                             </svg>
                           </button>
+                          <button
+                            type="button"
+                            className="card-overlay-btn danger"
+                            onClick={() => handleDeleteCapture(item)}
+                            title={settings?.delete_files_on_remove ? "Delete file from PC" : "Remove from SnapDrop"}
+                          >
+                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <polyline points="3 6 5 6 21 6"/>
+                              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                            </svg>
+                          </button>
                         </div>
                       </div>
                       <div className="card-body">
@@ -1065,13 +1120,18 @@ export default function SettingsApp() {
 
                 <section className="settings-section">
                   <h2>Diagnostics</h2>
-                  <p className="field-hint">Use this after the floating thumbnail stops responding. The log records renderer heartbeats, native window state, recovery attempts, and JavaScript errors.</p>
-                  <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                  <p className="field-hint">Use this after the floating thumbnail stops responding. The log records renderer heartbeats, native window state, recovery attempts, and JavaScript errors. The previous session's log is kept as well — critical when the app wedged instead of crashing, since the crash log only exists for hard panics.</p>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 10 }}>
                     <button type="button" onClick={async () => setDebugLog(await api.getDebugLog())}>View diagnostic log</button>
+                    <button type="button" onClick={async () => setPrevDebugLog(await api.getPrevDebugLog().catch(() => "No previous session log yet."))}>View previous session log</button>
                     <button type="button" onClick={() => api.openDebugLog()}>Open log in Notepad</button>
+                    <button type="button" onClick={() => api.openPrevDebugLog().catch(() => undefined)}>Open previous log</button>
                   </div>
                   {debugLog !== null && (
                     <textarea readOnly value={debugLog} style={{ width: "100%", minHeight: 220, marginTop: 10, fontFamily: "monospace", fontSize: 11 }} />
+                  )}
+                  {debugLog === null && prevDebugLog !== null && (
+                    <textarea readOnly value={prevDebugLog} style={{ width: "100%", minHeight: 220, marginTop: 10, fontFamily: "monospace", fontSize: 11 }} />
                   )}
                 </section>
 
@@ -1149,10 +1209,10 @@ export default function SettingsApp() {
                       <span className="field-label">Start with Windows</span>
                       <div className="field-hint">Launch SnapDrop automatically on system startup.</div>
                     </div>
-                    <input
-                      type="checkbox"
+                    <ToggleSwitch
                       checked={settings.start_with_windows}
-                      onChange={(e) => set({ start_with_windows: e.target.checked })}
+                      onChange={(v) => set({ start_with_windows: v })}
+                      ariaLabel="Start with Windows"
                     />
                   </div>
 
@@ -1161,10 +1221,10 @@ export default function SettingsApp() {
                       <span className="field-label">Annotate before showing thumbnail</span>
                       <div className="field-hint">Hold Ctrl while selecting to do the opposite: skip the editor when this is on, open it when off.</div>
                     </div>
-                    <input
-                      type="checkbox"
+                    <ToggleSwitch
                       checked={settings.show_editor_after_capture}
-                      onChange={(e) => set({ show_editor_after_capture: e.target.checked })}
+                      onChange={(v) => set({ show_editor_after_capture: v })}
+                      ariaLabel="Annotate before showing thumbnail"
                     />
                   </div>
 
@@ -1237,10 +1297,10 @@ export default function SettingsApp() {
                       <span className="field-label">Show floating thumbnail</span>
                       <div className="field-hint">Display draggable desktop pill upon capture.</div>
                     </div>
-                    <input
-                      type="checkbox"
+                    <ToggleSwitch
                       checked={settings.show_thumbnail}
-                      onChange={(e) => set({ show_thumbnail: e.target.checked })}
+                      onChange={(v) => set({ show_thumbnail: v })}
+                      ariaLabel="Show floating thumbnail"
                     />
                   </div>
 
@@ -1281,10 +1341,10 @@ export default function SettingsApp() {
                       <span className="field-label">Copy screenshot to clipboard</span>
                       <div className="field-hint">Automatic Ctrl+V paste support for captured images.</div>
                     </div>
-                    <input
-                      type="checkbox"
+                    <ToggleSwitch
                       checked={settings.copy_to_clipboard}
-                      onChange={(e) => set({ copy_to_clipboard: e.target.checked })}
+                      onChange={(v) => set({ copy_to_clipboard: v })}
+                      ariaLabel="Copy screenshot to clipboard"
                     />
                   </div>
 
@@ -1293,10 +1353,22 @@ export default function SettingsApp() {
                       <span className="field-label">Keep file after drag-to-drop</span>
                       <div className="field-hint">When disabled, successful move-drops remove the file.</div>
                     </div>
-                    <input
-                      type="checkbox"
+                    <ToggleSwitch
                       checked={settings.keep_after_drag}
-                      onChange={(e) => set({ keep_after_drag: e.target.checked })}
+                      onChange={(v) => set({ keep_after_drag: v })}
+                      ariaLabel="Keep file after drag-to-drop"
+                    />
+                  </div>
+
+                  <div className="field-row" style={{ marginTop: 12 }}>
+                    <div>
+                      <span className="field-label">Permanently delete files from PC</span>
+                      <div className="field-hint">When enabled, deleting captures or clearing history deletes the files from your drive. When disabled, items are only removed from SnapDrop.</div>
+                    </div>
+                    <ToggleSwitch
+                      checked={settings.delete_files_on_remove}
+                      onChange={(v) => set({ delete_files_on_remove: v })}
+                      ariaLabel="Permanently delete files from PC"
                     />
                   </div>
 
@@ -1304,10 +1376,10 @@ export default function SettingsApp() {
                     <div>
                       <span className="field-label">Confirm before deleting captures</span>
                     </div>
-                    <input
-                      type="checkbox"
+                    <ToggleSwitch
                       checked={settings.confirm_delete}
-                      onChange={(e) => set({ confirm_delete: e.target.checked })}
+                      onChange={(v) => set({ confirm_delete: v })}
+                      ariaLabel="Confirm before deleting captures"
                     />
                   </div>
 
@@ -1316,10 +1388,10 @@ export default function SettingsApp() {
                       <span className="field-label">Close button minimizes to tray</span>
                       <div className="field-hint">When off, pressing X quits the app.</div>
                     </div>
-                    <input
-                      type="checkbox"
+                    <ToggleSwitch
                       checked={settings.close_to_tray}
-                      onChange={(e) => set({ close_to_tray: e.target.checked })}
+                      onChange={(v) => set({ close_to_tray: v })}
+                      ariaLabel="Close button minimizes to tray"
                     />
                   </div>
                 </section>

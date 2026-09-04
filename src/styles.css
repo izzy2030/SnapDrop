@@ -126,6 +126,71 @@ input[type="checkbox"] {
   cursor: pointer;
 }
 
+/* Elegant Switch Toggle */
+.switch-toggle {
+  position: relative;
+  display: inline-block;
+  width: 40px;
+  height: 22px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.switch-toggle input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+  margin: 0;
+  position: absolute;
+}
+
+.switch-slider {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: #d1d5db;
+  border-radius: 999px;
+  transition: background-color 0.22s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.22s ease;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.12);
+}
+
+.switch-slider::before {
+  position: absolute;
+  content: "";
+  height: 16px;
+  width: 16px;
+  left: 3px;
+  bottom: 3px;
+  background-color: #ffffff;
+  border-radius: 50%;
+  transition: transform 0.22s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.22s ease;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.22);
+}
+
+.switch-toggle input:checked + .switch-slider {
+  background-color: var(--accent-orange);
+  box-shadow: 0 0 10px rgba(255, 106, 0, 0.35);
+}
+
+.switch-toggle input:checked + .switch-slider::before {
+  transform: translateX(18px);
+}
+
+.switch-toggle:hover .switch-slider {
+  background-color: #c4c9d2;
+}
+
+.switch-toggle:hover input:checked + .switch-slider {
+  background-color: var(--accent-orange-hover);
+}
+
+.switch-toggle input:focus-visible + .switch-slider {
+  outline: 2px solid var(--accent-orange);
+  outline-offset: 2px;
+}
+
 /* Layout App Shell */
 .app-container {
   display: flex;
@@ -216,6 +281,7 @@ input[type="checkbox"] {
   justify-content: space-between;
   box-shadow: 0 4px 14px rgba(16, 185, 129, 0.35);
   transition: transform 0.15s ease, box-shadow 0.15s ease;
+  cursor: pointer;
 }
 
 .btn-capture-hero:hover {
@@ -241,6 +307,50 @@ input[type="checkbox"] {
   padding: 2px 6px;
   font-size: 10px;
   letter-spacing: 0.03em;
+}
+
+/* Record Action (Sidebar Item) */
+.nav-item-action.record-action {
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.2);
+  color: #fca5a5;
+  margin-bottom: 6px;
+}
+
+.nav-item-action.record-action:hover {
+  background: rgba(239, 68, 68, 0.18);
+  border-color: rgba(239, 68, 68, 0.4);
+  color: #ffffff;
+  transform: translateY(-1px);
+}
+
+.nav-item-action.record-action:active {
+  transform: translateY(1px);
+}
+
+.record-video-icon {
+  width: 17px;
+  height: 17px;
+  color: #ef4444;
+  flex-shrink: 0;
+  transition: color 0.15s ease, filter 0.15s ease;
+}
+
+.nav-item-action.record-action:hover .record-video-icon {
+  color: #ff6b6b;
+  filter: drop-shadow(0 0 5px rgba(239, 68, 68, 0.6));
+}
+
+.sidebar-shortcut-tag {
+  background: rgba(0, 0, 0, 0.35);
+  color: #d1d5db;
+  border-radius: 4px;
+  padding: 2px 5px;
+  font-size: 10px;
+  font-family: inherit;
+  letter-spacing: 0.02em;
+  font-weight: 500;
+  border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
 /* Sidebar Nav Items */
@@ -624,6 +734,14 @@ input[type="checkbox"] {
   flex-shrink: 0;
   border: 1px solid #dbe0eb;
   position: relative;
+  cursor: pointer;
+  transition: transform 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+}
+
+.screenshot-thumb-box:hover {
+  border-color: #3b82f6;
+  transform: scale(1.05);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
 }
 
 .screenshot-thumb-img {
@@ -727,6 +845,7 @@ input[type="checkbox"] {
   width: 100%;
   height: 100%;
   object-fit: cover;
+  image-rendering: -webkit-optimize-contrast;
 }
 
 .card-overlay {
@@ -762,6 +881,11 @@ input[type="checkbox"] {
   background: #ffffff;
   color: #000000;
   transform: scale(1.1);
+}
+
+.card-overlay-btn.danger:hover {
+  background: #fee2e2;
+  color: #ef4444;
 }
 
 .card-body {

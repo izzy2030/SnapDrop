@@ -15,6 +15,7 @@ export interface Settings {
   show_editor_after_capture: boolean;
   max_history: number;
   confirm_delete: boolean;
+  delete_files_on_remove: boolean;
   close_to_tray: boolean;
   ocr_hotkey: string;
   capture_delay_secs: number;
@@ -66,6 +67,7 @@ export const api = {
   startDrag: (paths: string[]) => invoke<DragOutcome>("start_drag", { paths }),
   copyCapture: (path: string) => invoke<void>("copy_capture", { path }),
   captureNow: () => invoke<void>("capture_now"),
+  captureVideoNow: () => invoke<void>("capture_video_now"),
   videoRecordState: () => invoke<boolean>("video_record_state"),
   hideThumbnail: () => invoke<void>("hide_thumbnail"),
   pauseHotkey: (paused: boolean) => invoke<void>("pause_hotkey", { paused }),
@@ -80,6 +82,9 @@ export const api = {
   reportRendererInput: () => invoke<void>("report_renderer_input"),
   reportRendererPointerDown: () => invoke<void>("report_renderer_pointerdown"),
   getDebugLog: () => invoke<string>("get_debug_log"),
+  getPrevDebugLog: () => invoke<string>("get_prev_debug_log"),
   openDebugLog: () => invoke<void>("open_debug_log"),
+  openPrevDebugLog: () => invoke<void>("open_prev_debug_log"),
+  reportMainRendererReady: () => invoke<void>("report_main_renderer_ready"),
   ocrPendingEditorImage: () => invoke<string>("ocr_pending_editor_image"),
 };

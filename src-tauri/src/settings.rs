@@ -28,6 +28,9 @@ pub struct Settings {
     pub show_editor_after_capture: bool,
     pub max_history: usize,
     pub confirm_delete: bool,
+    /// When deleting or clearing captures, also delete the files from disk.
+    /// When false, captures are only removed from the app history.
+    pub delete_files_on_remove: bool,
     /// Close button sends the app to the tray instead of quitting.
     pub close_to_tray: bool,
     /// Global hotkey: capture a region and copy the recognized text (OCR).
@@ -66,15 +69,16 @@ impl Default for Settings {
             format: "png".into(),
             start_with_windows: true,
             show_thumbnail: true,
-            thumbnail_duration_secs: 0,
+            thumbnail_duration_secs: 10,
             thumbnail_size: "medium".into(),
             thumbnail_position: "bottom_left".into(),
             copy_to_clipboard: true,
             keep_after_drag: true,
             hide_after_drop: true,
-            show_editor_after_capture: true,
+            show_editor_after_capture: false,
             max_history: 10,
             confirm_delete: false,
+            delete_files_on_remove: false,
             close_to_tray: true,
             ocr_hotkey: "Ctrl+Alt+O".into(),
             // Duration of the delayed capture, armed by holding Shift while
