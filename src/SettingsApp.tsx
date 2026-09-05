@@ -1229,8 +1229,8 @@ export default function SettingsApp() {
                   </div>
 
                   <div className="field" style={{ marginTop: 12 }}>
-                    <span className="field-label">Shift+select delay (seconds)</span>
-                    <span className="field-hint">Hold Shift while selecting to capture after this delay — open menus and tooltips before the shot fires. 0 = Shift does nothing (instant capture).</span>
+                    <span className="field-label">Capture Timer (Delay in seconds)</span>
+                    <span className="field-hint">Gives you time to open dropdown menus, hover tooltips, or pose windows before the shot fires. Hold <strong>Shift</strong> while selecting to activate (0 = disabled).</span>
                     <input
                       type="number"
                       style={{ width: 140, marginTop: 4 }}
@@ -1260,7 +1260,7 @@ export default function SettingsApp() {
                       <kbd className="shortcut-keys">Hold Ctrl</kbd>
                     </div>
                     <div className="shortcut-item">
-                      <span className="shortcut-label">While selecting: delayed capture (fire after countdown)</span>
+                      <span className="shortcut-label">While selecting: activate capture timer (countdown delay)</span>
                       <kbd className="shortcut-keys">Hold Shift</kbd>
                     </div>
                     <div className="shortcut-item">
