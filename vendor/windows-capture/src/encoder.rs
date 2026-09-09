@@ -1,52 +1,25 @@
-use std::fs::{self, File};
 use std::path::Path;
-use std::sync::atomic::{self, AtomicBool};
-use std::sync::{Arc, mpsc};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
-use parking_lot::Mutex;
-use windows::Foundation::{TimeSpan, TypedEventHandler};
+use windows::Foundation::TimeSpan;
 use windows::Graphics::DirectX::Direct3D11::IDirect3DSurface;
 use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapEncoder, BitmapPixelFormat};
-use windows::Media::Core::{
-    AudioStreamDescriptor, MediaStreamSample, MediaStreamSource, MediaStreamSourceSampleRequestedEventArgs,
-    MediaStreamSourceStartingEventArgs, VideoStreamDescriptor,
-};
 use windows::Media::MediaProperties::{
-    AudioEncodingProperties, ContainerEncodingProperties, MediaEncodingProfile, MediaEncodingSubtypes,
-    VideoEncodingProperties,
+    AudioEncodingProperties, ContainerEncodingProperties, VideoEncodingProperties,
 };
-use windows::Media::Transcoding::MediaTranscoder;
-use windows::Security::Cryptography::CryptographicBuffer;
 use windows::Storage::Streams::{DataReader, IRandomAccessStream, InMemoryRandomAccessStream};
-use windows::Storage::{FileAccessMode, StorageFile};
-use windows::System::Threading::{ThreadPool, WorkItemHandler, WorkItemOptions, WorkItemPriority};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     ID3D11Device, ID3D11RenderTargetView, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::IDXGISurface;
+use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::WinRT::Direct3D11::CreateDirect3D11SurfaceFromDXGISurface;
 use windows::core::{HSTRING, Interface};
 
 use crate::d3d11::SendDirectX;
 use crate::frame::Frame;
 use crate::settings::ColorFormat;
-
-type VideoFrameReceiver = Arc<Mutex<mpsc::Receiver<Option<(VideoEncoderSource, TimeSpan)>>>>;
-type AudioFrameReceiver = Arc<Mutex<mpsc::Receiver<Option<(AudioEncoderSource, TimeSpan)>>>>;
-
-/// Depth of the video sample queue.
-///
-/// The upstream crate uses an *unbounded* channel, so a producer that outruns
-/// the encoder piles frames into RAM forever (8 MB each at 1080p) and the
-/// recording slides further behind real time. Capping it means the producer
-/// simply sheds a frame instead — for live capture, dropping is strictly
-/// better than lagging. Four frames of headroom is enough to absorb normal
-/// encoder jitter without ever starving `SampleRequested`.
-const MAX_QUEUED_FRAMES: usize = 4;
 
 #[derive(thiserror::Error, Debug)]
 /// Errors that can occur when encoding raw buffers to images via [`ImageEncoder`].
@@ -198,16 +171,6 @@ pub enum VideoEncoderError {
     /// Wraps [`windows::core::Error`].
     #[error("Windows API error: {0}")]
     WindowsError(#[from] windows::core::Error),
-    /// Failed to send a video sample into the internal pipeline.
-    ///
-    /// Typically indicates the internal channel is closed.
-    #[error("Failed to send frame: {0}")]
-    FrameSendError(#[from] mpsc::SendError<Option<(VideoEncoderSource, TimeSpan)>>),
-    /// Failed to send an audio sample into the internal pipeline.
-    ///
-    /// Typically indicates the internal channel is closed.
-    #[error("Failed to send audio: {0}")]
-    AudioSendError(#[from] mpsc::SendError<Option<(AudioEncoderSource, TimeSpan)>>),
     /// Video encoding was disabled via [`VideoSettingsBuilder::disabled`].
     #[error("Video encoding is disabled")]
     VideoDisabled,
@@ -224,9 +187,6 @@ pub enum VideoEncoderError {
     /// See [`crate::settings::ColorFormat`].
     #[error("Unsupported frame color format: {0:?}")]
     UnsupportedFrameFormat(ColorFormat),
-    /// The bounded video queue rejected a sample (full or closed).
-    #[error("Failed to send frame: {0}")]
-    FrameTrySendError(#[from] mpsc::TrySendError<Option<(VideoEncoderSource, TimeSpan)>>),
 }
 
 unsafe impl Send for VideoEncoderError {}
@@ -658,76 +618,23 @@ impl ContainerSettingsSubType {
 
 /// Encodes video frames (and optional audio) and writes them to a file or stream.
 ///
-/// Frames are provided as Direct3D surfaces or raw BGRA buffers. Audio can be pushed
-/// as interleaved PCM bytes.
-///
-/// - Use [`VideoEncoder::new`] for file output or [`VideoEncoder::new_from_stream`] for stream
-///   output.
-/// - Push frames with [`VideoEncoder::send_frame`] or [`VideoEncoder::send_frame_buffer`].
-/// - Optionally push audio with [`VideoEncoder::send_audio_buffer`] or use
-///   [`VideoEncoder::send_frame_with_audio`].
-/// - Call [`VideoEncoder::finish`] to finalize the container.
-///
-/// # Example
-/// ```no_run
-/// use windows_capture::encoder::{
-///     AudioSettingsBuilder, ContainerSettingsBuilder, VideoEncoder, VideoSettingsBuilder,
-/// };
-///
-/// // Create an encoder that outputs H.265 in an MP4 container
-/// let mut encoder = VideoEncoder::new(
-///     VideoSettingsBuilder::new(1920, 1080),
-///     AudioSettingsBuilder::new().disabled(true),
-///     ContainerSettingsBuilder::new(),
-///     "capture.mp4",
-/// )
-/// .unwrap();
-///
-/// // In your capture loop, push frames:
-/// // encoder.send_frame(&frame).unwrap();
-///
-/// // When done:
-/// // encoder.finish().unwrap();
-/// ```
+/// Uses `IMFSinkWriter` for VFR (Variable Frame Rate) output: each frame is
+/// written at its exact timestamp without CFR padding or duplication.
 pub struct VideoEncoder {
-    // Video timing
     first_timestamp: Option<TimeSpan>,
-
-    // Channels
-    //
-    // Video is a *bounded* queue (see `MAX_QUEUED_FRAMES`): when the encoder
-    // can't keep up, `send_frame*` drops the incoming sample instead of
-    // queueing it, so the pipeline stays at (or near) real time and memory
-    // stays flat.
-    frame_sender: mpsc::SyncSender<Option<(VideoEncoderSource, TimeSpan)>>,
-    audio_sender: mpsc::Sender<Option<(AudioEncoderSource, TimeSpan)>>,
-    /// Samples shed because the queue was full. Diagnostic only.
-    dropped_frames: u64,
-
-    // MSS event tokens
-    sample_requested: i64,
-    media_stream_source: MediaStreamSource,
-    starting: i64,
-
-    // Transcode worker
-    transcode_thread: Option<JoinHandle<Result<(), VideoEncoderError>>>,
-    error_notify: Arc<AtomicBool>,
-
-    // Feature toggles
+    sink_writer: IMFSinkWriter,
+    video_stream_index: u32,
+    audio_stream_index: u32,
     is_video_disabled: bool,
     is_audio_disabled: bool,
-
-    // --- NEW: audio clock & format bookkeeping (monotonic timing) ---
-    audio_sample_rate: u32,  // Hz (frames per second)
-    audio_block_align: u32,  // bytes per interleaved sample frame (channels * (bits/8))
-    audio_samples_sent: u64, // number of sample frames (not bytes) emitted so far
-
-    // Video sizing constraints
+    audio_sample_rate: u32,
+    audio_block_align: u32,
+    audio_samples_sent: u64,
     target_width: u32,
     target_height: u32,
     target_color_format: ColorFormat,
-
     cached_surface: Option<CachedSurface>,
+    dropped_frames: u64,
 }
 
 impl VideoEncoder {
@@ -776,374 +683,131 @@ impl VideoEncoder {
         })
     }
 
-    fn attach_sample_requested_handlers(
-        media_stream_source: &MediaStreamSource,
-        is_video_disabled: bool,
-        is_audio_disabled: bool,
-        frame_receiver: VideoFrameReceiver,
-        audio_receiver: AudioFrameReceiver,
-        audio_block_align: u32,
-        audio_sample_rate: u32,
-    ) -> Result<i64, VideoEncoderError> {
-        let token = media_stream_source.SampleRequested(&TypedEventHandler::<
-            MediaStreamSource,
-            MediaStreamSourceSampleRequestedEventArgs,
-        >::new(move |_, sample_requested| {
-            let sample_requested = sample_requested
-                .as_ref()
-                .expect("MediaStreamSource SampleRequested parameter was None. This should not happen.");
-
-            let request = sample_requested.Request()?;
-            let is_audio = request.StreamDescriptor()?.cast::<AudioStreamDescriptor>().is_ok();
-
-            // Always offload blocking work to the thread pool; never block the MSS event
-            // thread.
-            let deferral = request.GetDeferral()?;
-
-            if is_audio {
-                if is_audio_disabled {
-                    request.SetSample(None)?;
-                    deferral.Complete()?;
-                } else {
-                    let request_clone = request;
-                    let audio_receiver = audio_receiver.clone();
-                    ThreadPool::RunWithPriorityAndOptionsAsync(
-                        &WorkItemHandler::new(move |_| {
-                            let value = audio_receiver.lock().recv();
-                            match value {
-                                Ok(Some((source, timestamp))) => {
-                                    let sample = match source {
-                                        AudioEncoderSource::Buffer(bytes) => {
-                                            let buf = CryptographicBuffer::CreateFromByteArray(&bytes)?;
-                                            let sample = MediaStreamSample::CreateFromBuffer(&buf, timestamp)?;
-                                            // Duration = (frames / sample_rate) in 100ns ticks
-                                            // frames = bytes / block_align
-                                            let frames = (bytes.len() as u32) / audio_block_align;
-                                            let duration_ticks =
-                                                (frames as i64) * 10_000_000i64 / (audio_sample_rate as i64);
-                                            sample.SetDuration(TimeSpan { Duration: duration_ticks })?;
-                                            sample
-                                        }
-                                    };
-                                    request_clone.SetSample(&sample)?;
-                                }
-                                Ok(None) | Err(_) => {
-                                    request_clone.SetSample(None)?;
-                                }
-                            }
-                            deferral.Complete()?;
-                            Ok(())
-                        }),
-                        WorkItemPriority::Normal,
-                        WorkItemOptions::None,
-                    )?;
-                }
-            } else if is_video_disabled {
-                request.SetSample(None)?;
-                deferral.Complete()?;
-            } else {
-                let request_clone = request;
-                let frame_receiver = frame_receiver.clone();
-                ThreadPool::RunWithPriorityAndOptionsAsync(
-                    &WorkItemHandler::new(move |_| {
-                        let value = frame_receiver.lock().recv();
-                        match value {
-                            Ok(Some((source, timestamp))) => {
-                                let sample = match source {
-                                    VideoEncoderSource::DirectX(surface) => {
-                                        MediaStreamSample::CreateFromDirect3D11Surface(&surface.0, timestamp)?
-                                    }
-                                    VideoEncoderSource::Buffer(bytes) => {
-                                        let buf = CryptographicBuffer::CreateFromByteArray(&bytes)?;
-                                        MediaStreamSample::CreateFromBuffer(&buf, timestamp)?
-                                    }
-                                };
-                                request_clone.SetSample(&sample)?;
-                            }
-                            Ok(None) | Err(_) => {
-                                request_clone.SetSample(None)?;
-                            }
-                        }
-                        deferral.Complete()?;
-                        Ok(())
-                    }),
-                    WorkItemPriority::Normal,
-                    WorkItemOptions::None,
-                )?;
-            }
-
-            Ok(())
-        }))?;
-        Ok(token)
-    }
-
-    /// Constructs a new `VideoEncoder` that writes to a file path.
+    /// Constructs a new `VideoEncoder` that writes to a file path using
+    /// `IMFSinkWriter` for VFR output (no CFR padding).
     #[inline]
     pub fn new<P: AsRef<Path>>(
         video_settings: VideoSettingsBuilder,
         audio_settings: AudioSettingsBuilder,
-        container_settings: ContainerSettingsBuilder,
+        _container_settings: ContainerSettingsBuilder,
         path: P,
     ) -> Result<Self, VideoEncoderError> {
-        let path = path.as_ref();
-        let media_encoding_profile = MediaEncodingProfile::new()?;
+        unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL)? };
 
-        let (video_encoding_properties_cfg, is_video_disabled) = video_settings.build()?;
-        media_encoding_profile.SetVideo(&video_encoding_properties_cfg)?;
-        let (audio_encoding_properties_cfg, is_audio_disabled) = audio_settings.build()?;
-        media_encoding_profile.SetAudio(&audio_encoding_properties_cfg)?;
-        let container_encoding_properties = container_settings.build()?;
-        media_encoding_profile.SetContainer(&container_encoding_properties)?;
+        let (video_cfg, is_video_disabled) = video_settings.build()?;
+        let (audio_cfg, is_audio_disabled) = audio_settings.build()?;
 
-        let target_width = video_encoding_properties_cfg.Width()?;
-        let target_height = video_encoding_properties_cfg.Height()?;
-        let target_color_format = ColorFormat::Bgra8;
+        let target_width = video_cfg.Width()?;
+        let target_height = video_cfg.Height()?;
+        let target_fps = video_cfg.FrameRate()?.Numerator()?;
+        let video_bitrate = video_cfg.Bitrate()?;
 
-        let video_encoding_properties = VideoEncodingProperties::CreateUncompressed(
-            &MediaEncodingSubtypes::Bgra8()?,
-            video_encoding_properties_cfg.Width()?,
-            video_encoding_properties_cfg.Height()?,
-        )?;
-        let video_stream_descriptor = VideoStreamDescriptor::Create(&video_encoding_properties)?;
-
-        // Stream descriptor uses PCM; the profile still encodes to AAC/OPUS/etc.
-        let audio_desc_props = AudioEncodingProperties::CreatePcm(
-            audio_encoding_properties_cfg.SampleRate()?,
-            audio_encoding_properties_cfg.ChannelCount()?,
-            audio_encoding_properties_cfg.BitsPerSample()?,
-        )?;
-        let audio_stream_descriptor = AudioStreamDescriptor::Create(&audio_desc_props)?;
-
-        // Compute audio block align/sample-rate for monotonic clock
-        let audio_sr = audio_desc_props.SampleRate()?;
-        let audio_ch = audio_desc_props.ChannelCount()?;
-        let audio_bps = audio_desc_props.BitsPerSample()?;
+        let audio_sr = audio_cfg.SampleRate()?;
+        let audio_ch = audio_cfg.ChannelCount()?;
+        let audio_bps = audio_cfg.BitsPerSample()?;
         let audio_block_align = (audio_bps / 8) * audio_ch;
 
-        let media_stream_source =
-            MediaStreamSource::CreateFromDescriptors(&video_stream_descriptor, &audio_stream_descriptor)?;
-        // Keep a modest buffer (30ms)
-        media_stream_source.SetBufferTime(Duration::from_millis(30).into())?;
+        let path = path.as_ref();
+        let path_hstring = HSTRING::from(path.as_os_str());
 
-        let starting = media_stream_source.Starting(&TypedEventHandler::<
-            MediaStreamSource,
-            MediaStreamSourceStartingEventArgs,
-        >::new(move |_, stream_start| {
-            let stream_start =
-                stream_start.as_ref().expect("MediaStreamSource Starting parameter was None. This should not happen.");
-            stream_start.Request()?.SetActualStartPosition(TimeSpan { Duration: 0 })?;
-            Ok(())
-        }))?;
+        let sink_writer: IMFSinkWriter = unsafe {
+            MFCreateSinkWriterFromURL(&path_hstring, None, None)?
+        };
 
-        let (frame_sender, frame_receiver_raw) =
-            mpsc::sync_channel::<Option<(VideoEncoderSource, TimeSpan)>>(MAX_QUEUED_FRAMES);
-        let (audio_sender, audio_receiver_raw) = mpsc::channel::<Option<(AudioEncoderSource, TimeSpan)>>();
+        // ---- Video output type (H.264) ----
+        let video_out = unsafe { MFCreateMediaType()? };
+        unsafe {
+            video_out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+            video_out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+            video_out.SetUINT32(&MF_MT_AVG_BITRATE, video_bitrate)?;
+            video_out.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+            video_out.SetUINT64(&MF_MT_FRAME_SIZE, ((target_width as u64) << 32) | target_height as u64)?;
+            video_out.SetUINT64(&MF_MT_FRAME_RATE, ((target_fps as u64) << 32) | 1)?;
+            video_out.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1u64 << 32) | 1)?;
+        }
 
-        let frame_receiver = Arc::new(Mutex::new(frame_receiver_raw));
-        let audio_receiver = Arc::new(Mutex::new(audio_receiver_raw));
+        let video_stream_index = unsafe { sink_writer.AddStream(&video_out)? };
 
-        let sample_requested = Self::attach_sample_requested_handlers(
-            &media_stream_source,
-            is_video_disabled,
-            is_audio_disabled,
-            frame_receiver,
-            audio_receiver,
-            audio_block_align,
-            audio_sr,
-        )?;
+        // ---- Video input type (uncompressed BGRA) ----
+        let video_in = unsafe { MFCreateMediaType()? };
+        unsafe {
+            video_in.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+            video_in.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_ARGB32)?;
+            video_in.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+            video_in.SetUINT64(&MF_MT_FRAME_SIZE, ((target_width as u64) << 32) | target_height as u64)?;
+            video_in.SetUINT64(&MF_MT_FRAME_RATE, ((target_fps as u64) << 32) | 1)?;
+            video_in.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1u64 << 32) | 1)?;
+            video_in.SetUINT32(&MF_MT_DEFAULT_STRIDE, (target_width * 4) as u32)?;
+        }
 
-        let media_transcoder = MediaTranscoder::new()?;
-        media_transcoder.SetHardwareAccelerationEnabled(true)?;
+        unsafe {
+            sink_writer.SetInputMediaType(video_stream_index, &video_in, None)?;
+        }
 
-        File::create(path)?;
-        let path = fs::canonicalize(path)?.to_string_lossy()[4..].to_string();
-        let path = Path::new(&path);
-        let path = &HSTRING::from(path.as_os_str().to_os_string());
+        // ---- Audio output type (AAC) ----
+        let audio_out = unsafe { MFCreateMediaType()? };
+        unsafe {
+            audio_out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+            audio_out.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC)?;
+            audio_out.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, audio_sr)?;
+            audio_out.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, audio_ch as u32)?;
+            audio_out.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, audio_bps as u32)?;
+        }
 
-        let file = StorageFile::GetFileFromPathAsync(path)?.join()?;
-        let media_stream_output = file.OpenAsync(FileAccessMode::ReadWrite)?.join()?;
+        let audio_stream_index = unsafe { sink_writer.AddStream(&audio_out)? };
 
-        let transcode = media_transcoder
-            .PrepareMediaStreamSourceTranscodeAsync(
-                &media_stream_source,
-                &media_stream_output,
-                &media_encoding_profile,
-            )?
-            .join()?;
+        // ---- Audio input type (PCM) ----
+        let audio_in = unsafe { MFCreateMediaType()? };
+        unsafe {
+            audio_in.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+            audio_in.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
+            audio_in.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, audio_sr)?;
+            audio_in.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, audio_ch as u32)?;
+            audio_in.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, audio_bps as u32)?;
+            audio_in.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, audio_block_align)?;
+            audio_in.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, audio_sr * audio_block_align)?;
+        }
 
-        let error_notify = Arc::new(AtomicBool::new(false));
-        let transcode_thread = thread::spawn({
-            let error_notify = error_notify.clone();
-            move || -> Result<(), VideoEncoderError> {
-                let result = transcode.TranscodeAsync();
-                if result.is_err() {
-                    error_notify.store(true, atomic::Ordering::Relaxed);
-                }
-                result?.join()?;
-                drop(media_transcoder);
-                Ok(())
-            }
-        });
+        unsafe {
+            sink_writer.SetInputMediaType(audio_stream_index, &audio_in, None)?;
+        }
+
+        // Start writing.
+        unsafe {
+            sink_writer.BeginWriting()?;
+        }
 
         Ok(Self {
+            sink_writer,
+            video_stream_index,
+            audio_stream_index,
             first_timestamp: None,
-            frame_sender,
-            audio_sender,
-            sample_requested,
-            media_stream_source,
-            starting,
-            transcode_thread: Some(transcode_thread),
-            error_notify,
             is_video_disabled,
             is_audio_disabled,
+            target_width,
+            target_height,
+            target_color_format: ColorFormat::Bgra8,
+            cached_surface: None,
+            dropped_frames: 0,
             audio_sample_rate: audio_sr,
             audio_block_align,
             audio_samples_sent: 0,
-            target_width,
-            target_height,
-            target_color_format,
-            cached_surface: None,
-            dropped_frames: 0,
         })
     }
 
     /// Constructs a new `VideoEncoder` that writes to the given stream.
     ///
-    /// Unlike [`VideoEncoder::new`], which writes directly to a file, this constructor writes
-    /// encoded output into any [`IRandomAccessStream`]. Use [`InMemoryRandomAccessStream`] to
-    /// keep the encoded video in memory (e.g., for network streaming or further processing).
-    ///
-    /// # Example
-    /// ```no_run
-    /// use windows::Storage::Streams::InMemoryRandomAccessStream;
-    /// use windows::core::Interface;
-    /// use windows_capture::encoder::{
-    ///     AudioSettingsBuilder, ContainerSettingsBuilder, VideoEncoder, VideoSettingsBuilder,
-    /// };
-    ///
-    /// let stream = InMemoryRandomAccessStream::new().unwrap();
-    ///
-    /// let encoder = VideoEncoder::new_from_stream(
-    ///     VideoSettingsBuilder::new(1920, 1080),
-    ///     AudioSettingsBuilder::new().disabled(true),
-    ///     ContainerSettingsBuilder::new(),
-    ///     stream.cast().unwrap(),
-    /// )
-    /// .unwrap();
-    /// ```
+    /// **Not implemented for IMFSinkWriter.** Use [`VideoEncoder::new`] instead.
     #[inline]
     pub fn new_from_stream(
-        video_settings: VideoSettingsBuilder,
-        audio_settings: AudioSettingsBuilder,
-        container_settings: ContainerSettingsBuilder,
-        stream: IRandomAccessStream,
+        _video_settings: VideoSettingsBuilder,
+        _audio_settings: AudioSettingsBuilder,
+        _container_settings: ContainerSettingsBuilder,
+        _stream: IRandomAccessStream,
     ) -> Result<Self, VideoEncoderError> {
-        let media_encoding_profile = MediaEncodingProfile::new()?;
-
-        let (video_encoding_properties_cfg, is_video_disabled) = video_settings.build()?;
-        media_encoding_profile.SetVideo(&video_encoding_properties_cfg)?;
-        let (audio_encoding_properties_cfg, is_audio_disabled) = audio_settings.build()?;
-        media_encoding_profile.SetAudio(&audio_encoding_properties_cfg)?;
-        let container_encoding_properties = container_settings.build()?;
-        media_encoding_profile.SetContainer(&container_encoding_properties)?;
-
-        let target_width = video_encoding_properties_cfg.Width()?;
-        let target_height = video_encoding_properties_cfg.Height()?;
-        let target_color_format = ColorFormat::Bgra8;
-
-        let video_encoding_properties = VideoEncodingProperties::CreateUncompressed(
-            &MediaEncodingSubtypes::Bgra8()?,
-            video_encoding_properties_cfg.Width()?,
-            video_encoding_properties_cfg.Height()?,
-        )?;
-        let video_stream_descriptor = VideoStreamDescriptor::Create(&video_encoding_properties)?;
-
-        let audio_desc_props = AudioEncodingProperties::CreatePcm(
-            audio_encoding_properties_cfg.SampleRate()?,
-            audio_encoding_properties_cfg.ChannelCount()?,
-            audio_encoding_properties_cfg.BitsPerSample()?,
-        )?;
-        let audio_stream_descriptor = AudioStreamDescriptor::Create(&audio_desc_props)?;
-
-        // Monotonic audio timing parameters
-        let audio_sr = audio_desc_props.SampleRate()?;
-        let audio_ch = audio_desc_props.ChannelCount()?;
-        let audio_bps = audio_desc_props.BitsPerSample()?;
-        let audio_block_align = (audio_bps / 8) * audio_ch;
-
-        let media_stream_source =
-            MediaStreamSource::CreateFromDescriptors(&video_stream_descriptor, &audio_stream_descriptor)?;
-        // CHANGED: use 30ms buffer (was 0)
-        media_stream_source.SetBufferTime(Duration::from_millis(30).into())?;
-
-        let starting = media_stream_source.Starting(&TypedEventHandler::<
-            MediaStreamSource,
-            MediaStreamSourceStartingEventArgs,
-        >::new(move |_, stream_start| {
-            let stream_start =
-                stream_start.as_ref().expect("MediaStreamSource Starting parameter was None. This should not happen.");
-            stream_start.Request()?.SetActualStartPosition(TimeSpan { Duration: 0 })?;
-            Ok(())
-        }))?;
-
-        let (frame_sender, frame_receiver_raw) =
-            mpsc::sync_channel::<Option<(VideoEncoderSource, TimeSpan)>>(MAX_QUEUED_FRAMES);
-        let (audio_sender, audio_receiver_raw) = mpsc::channel::<Option<(AudioEncoderSource, TimeSpan)>>();
-
-        let frame_receiver = Arc::new(Mutex::new(frame_receiver_raw));
-        let audio_receiver = Arc::new(Mutex::new(audio_receiver_raw));
-
-        let sample_requested = Self::attach_sample_requested_handlers(
-            &media_stream_source,
-            is_video_disabled,
-            is_audio_disabled,
-            frame_receiver,
-            audio_receiver,
-            audio_block_align,
-            audio_sr,
-        )?;
-
-        let media_transcoder = MediaTranscoder::new()?;
-        media_transcoder.SetHardwareAccelerationEnabled(true)?;
-
-        let transcode = media_transcoder
-            .PrepareMediaStreamSourceTranscodeAsync(&media_stream_source, &stream, &media_encoding_profile)?
-            .join()?;
-
-        let error_notify = Arc::new(AtomicBool::new(false));
-        let transcode_thread = thread::spawn({
-            let error_notify = error_notify.clone();
-            move || -> Result<(), VideoEncoderError> {
-                let result = transcode.TranscodeAsync();
-                if result.is_err() {
-                    error_notify.store(true, atomic::Ordering::Relaxed);
-                }
-                result?.join()?;
-                drop(media_transcoder);
-                Ok(())
-            }
-        });
-
-        Ok(Self {
-            first_timestamp: None,
-            frame_sender,
-            audio_sender,
-            sample_requested,
-            media_stream_source,
-            starting,
-            transcode_thread: Some(transcode_thread),
-            error_notify,
-            is_video_disabled,
-            is_audio_disabled,
-            audio_sample_rate: audio_sr,
-            audio_block_align,
-            audio_samples_sent: 0,
-            target_width,
-            target_height,
-            target_color_format,
-            cached_surface: None,
-            dropped_frames: 0,
-        })
+        Err(VideoEncoderError::WindowsError(windows::core::Error::from_hresult(
+            windows::Win32::Foundation::E_NOTIMPL,
+        )))
     }
 
     fn build_padded_surface(&mut self, frame: &Frame) -> Result<SendDirectX<IDirect3DSurface>, VideoEncoderError> {
@@ -1270,39 +934,89 @@ impl VideoEncoder {
         Ok(SendDirectX::new(cache.surface.0.clone()))
     }
 
-    /// Pushes one video sample into the bounded queue.
-    ///
-    /// Sheds the sample (counting it) when the queue is full, so capture stays
-    /// near real time instead of building a backlog. Errors only when the
-    /// pipeline itself has gone away.
-    fn push_video_sample(
+    /// Writes a video sample to the sink writer.
+    fn write_video_sample(
         &mut self,
         source: VideoEncoderSource,
         timestamp: TimeSpan,
     ) -> Result<(), VideoEncoderError> {
-        match self.frame_sender.try_send(Some((source, timestamp))) {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => self.dropped_frames += 1,
-            Err(e @ mpsc::TrySendError::Disconnected(_)) => return Err(e.into()),
+        let sample = unsafe { MFCreateSample()? };
+
+        match source {
+            VideoEncoderSource::DirectX(surface) => {
+                let dxgi: IDXGISurface = surface.0.cast()?;
+                let media_buffer = unsafe {
+                    MFCreateDXGISurfaceBuffer(
+                        &IDXGISurface::IID,
+                        &dxgi,
+                        0,
+                        false,
+                    )?
+                };
+                unsafe {
+                    sample.AddBuffer(&media_buffer)?;
+                }
+            }
+            VideoEncoderSource::Buffer(bytes) => {
+                let media_buffer = unsafe {
+                    let buf = MFCreateMemoryBuffer(bytes.len() as u32)?;
+                    let mut data: *mut u8 = std::ptr::null_mut();
+                    let mut max_len: u32 = 0;
+                    buf.Lock(&mut data, Some(&mut max_len), None)?;
+                    if !data.is_null() {
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len());
+                    }
+                    buf.Unlock()?;
+                    buf.SetCurrentLength(bytes.len() as u32)?;
+                    buf
+                };
+                unsafe {
+                    sample.AddBuffer(&media_buffer)?;
+                }
+            }
         }
 
-        if self.error_notify.load(atomic::Ordering::Relaxed)
-            && let Some(t) = self.transcode_thread.take()
-        {
-            t.join().expect("Failed to join transcode thread")?;
+        unsafe {
+            sample.SetSampleTime(timestamp.Duration)?;
+            sample.SetSampleDuration(1)?;
+            self.sink_writer.WriteSample(self.video_stream_index, &sample)?;
+        }
+
+        Ok(())
+    }
+
+    /// Writes an audio sample to the sink writer.
+    fn write_audio_sample(
+        &mut self,
+        buffer: &[u8],
+        timestamp: TimeSpan,
+        duration: i64,
+    ) -> Result<(), VideoEncoderError> {
+        let media_buffer = unsafe {
+            let buf = MFCreateMemoryBuffer(buffer.len() as u32)?;
+            let mut data: *mut u8 = std::ptr::null_mut();
+            let mut max_len: u32 = 0;
+            buf.Lock(&mut data, Some(&mut max_len), None)?;
+            if !data.is_null() {
+                std::ptr::copy_nonoverlapping(buffer.as_ptr(), data, buffer.len());
+            }
+            buf.Unlock()?;
+            buf.SetCurrentLength(buffer.len() as u32)?;
+            buf
+        };
+
+        let sample = unsafe { MFCreateSample()? };
+        unsafe {
+            sample.AddBuffer(&media_buffer)?;
+            sample.SetSampleTime(timestamp.Duration)?;
+            sample.SetSampleDuration(duration)?;
+            self.sink_writer.WriteSample(self.audio_stream_index, &sample)?;
         }
 
         Ok(())
     }
 
     /// Sends a region of `frame`, cropped on the GPU with zero CPU copies.
-    ///
-    /// `origin_x`/`origin_y` are the region's top-left in capture-texture
-    /// pixels; the crop is `target_width` x `target_height`.
-    ///
-    /// `timestamp` is in 100 ns units on an arbitrary origin (the first sample
-    /// anchors it), matching [`Self::send_frame_buffer`]. Pass the frame's own
-    /// `Frame::timestamp()` for true presentation timing.
     #[inline]
     pub fn send_frame_region(
         &mut self,
@@ -1325,27 +1039,13 @@ impl VideoEncoder {
             }
         };
 
-        self.push_video_sample(VideoEncoderSource::DirectX(surface), timestamp)
+        self.write_video_sample(VideoEncoderSource::DirectX(surface), timestamp)
     }
 
     /// Samples shed because the encoder could not keep up. Diagnostic only.
     #[inline]
     pub const fn dropped_frames(&self) -> u64 {
         self.dropped_frames
-    }
-
-    /// Signals end-of-stream on the bounded video queue.
-    ///
-    /// Retries briefly instead of blocking forever: if the consumer has stopped
-    /// draining, a blocking `send` here would wedge `finish()`/`drop()`.
-    fn signal_video_eos(&self) {
-        for _ in 0..200 {
-            match self.frame_sender.try_send(None) {
-                Ok(()) => return,
-                Err(mpsc::TrySendError::Full(_)) => thread::sleep(Duration::from_millis(10)),
-                Err(mpsc::TrySendError::Disconnected(_)) => return,
-            }
-        }
     }
 
     /// Sends a video frame (DirectX). Returns immediately.
@@ -1370,7 +1070,7 @@ impl VideoEncoder {
             self.build_padded_surface(frame)?
         };
 
-        self.push_video_sample(VideoEncoderSource::DirectX(surface), timestamp)
+        self.write_video_sample(VideoEncoderSource::DirectX(surface), timestamp)
     }
 
     /// Sends a video frame and an audio buffer (owned). Returns immediately.
@@ -1384,7 +1084,6 @@ impl VideoEncoder {
             return Err(VideoEncoderError::AudioDisabled);
         }
 
-        // Video timestamp based on capture timestamps (as before)
         let video_ts = match self.first_timestamp {
             Some(t0) => TimeSpan { Duration: frame.timestamp()?.Duration - t0.Duration },
             None => {
@@ -1400,45 +1099,34 @@ impl VideoEncoder {
             self.build_padded_surface(frame)?
         };
 
-        let _ = self.push_video_sample(VideoEncoderSource::DirectX(surface), video_ts);
+        let _ = self.write_video_sample(VideoEncoderSource::DirectX(surface), video_ts);
 
-        // Audio timestamp from running sample count
         let frames_in_buf = (audio_buffer.len() as u32) / self.audio_block_align;
         let audio_ts_ticks = ((self.audio_samples_sent as i128) * 10_000_000i128) / (self.audio_sample_rate as i128);
         let audio_ts = TimeSpan { Duration: audio_ts_ticks as i64 };
+        let duration = (frames_in_buf as i64) * 10_000_000 / (self.audio_sample_rate as i64);
 
-        self.audio_sender.send(Some((AudioEncoderSource::Buffer(audio_buffer.to_vec()), audio_ts)))?;
-
-        // Advance counter after stamping
         self.audio_samples_sent = self.audio_samples_sent.saturating_add(frames_in_buf as u64);
 
-        if self.error_notify.load(atomic::Ordering::Relaxed)
-            && let Some(t) = self.transcode_thread.take()
-        {
-            t.join().expect("Failed to join transcode thread")?;
-        }
-
-        Ok(())
+        self.write_audio_sample(audio_buffer, audio_ts, duration)
     }
 
     /// Sends a raw frame buffer (owned inside). Returns immediately.
-    /// Windows expects BGRA and bottom-to-top layout for this path.
     #[inline]
     pub fn send_frame_buffer(&mut self, buffer: &[u8], timestamp: i64) -> Result<(), VideoEncoderError> {
         if self.is_video_disabled {
             return Err(VideoEncoderError::VideoDisabled);
         }
 
-        let frame_timestamp = timestamp;
         let timestamp = match self.first_timestamp {
-            Some(t0) => TimeSpan { Duration: frame_timestamp - t0.Duration },
+            Some(t0) => TimeSpan { Duration: timestamp - t0.Duration },
             None => {
-                self.first_timestamp = Some(TimeSpan { Duration: frame_timestamp });
+                self.first_timestamp = Some(TimeSpan { Duration: timestamp });
                 TimeSpan { Duration: 0 }
             }
         };
 
-        self.push_video_sample(VideoEncoderSource::Buffer(buffer.to_vec()), timestamp)
+        self.write_video_sample(VideoEncoderSource::Buffer(buffer.to_vec()), timestamp)
     }
 
     /// Sends an audio buffer (owned inside). Returns immediately.
@@ -1447,7 +1135,7 @@ impl VideoEncoder {
     pub fn send_audio_buffer(
         &mut self,
         buffer: &[u8],
-        _timestamp: i64, // ignored to guarantee monotonic audio timing
+        _timestamp: i64,
     ) -> Result<(), VideoEncoderError> {
         if self.is_audio_disabled {
             return Err(VideoEncoderError::AudioDisabled);
@@ -1456,48 +1144,20 @@ impl VideoEncoder {
         let frames_in_buf = (buffer.len() as u32) / self.audio_block_align;
         let audio_ts_ticks = ((self.audio_samples_sent as i128) * 10_000_000i128) / (self.audio_sample_rate as i128);
         let timestamp = TimeSpan { Duration: audio_ts_ticks as i64 };
-
-        self.audio_sender.send(Some((AudioEncoderSource::Buffer(buffer.to_vec()), timestamp)))?;
+        let duration = (frames_in_buf as i64) * 10_000_000 / (self.audio_sample_rate as i64);
 
         self.audio_samples_sent = self.audio_samples_sent.saturating_add(frames_in_buf as u64);
 
-        if self.error_notify.load(atomic::Ordering::Relaxed)
-            && let Some(t) = self.transcode_thread.take()
-        {
-            t.join().expect("Failed to join transcode thread")?;
-        }
-
-        Ok(())
+        self.write_audio_sample(buffer, timestamp, duration)
     }
 
     /// Finishes the encoding and performs any necessary cleanup.
     #[inline]
-    pub fn finish(mut self) -> Result<(), VideoEncoderError> {
-        // 1) Signal EOS on both streams.
-        self.signal_video_eos();
-        let _ = self.audio_sender.send(None);
-
-        // 2) **Close the channels** so any further recv() returns Err immediately. We replace the fields
-        //    with dummy senders and drop the originals now.
-        {
-            let (dummy_tx_v, _dummy_rx_v) = mpsc::sync_channel::<Option<(VideoEncoderSource, TimeSpan)>>(1);
-            let (dummy_tx_a, _dummy_rx_a) = mpsc::channel::<Option<(AudioEncoderSource, TimeSpan)>>();
-
-            let old_v = std::mem::replace(&mut self.frame_sender, dummy_tx_v);
-            let old_a = std::mem::replace(&mut self.audio_sender, dummy_tx_a);
-            drop(old_v);
-            drop(old_a);
+    pub fn finish(self) -> Result<(), VideoEncoderError> {
+        unsafe {
+            self.sink_writer.Finalize()?;
+            MFShutdown()?;
         }
-
-        // 3) Wait for the transcoder to flush and finalize.
-        if let Some(transcode_thread) = self.transcode_thread.take() {
-            transcode_thread.join().expect("Failed to join transcode thread")?;
-        }
-
-        // 4) Unhook events after pipeline has completed.
-        self.media_stream_source.RemoveStarting(self.starting)?;
-        self.media_stream_source.RemoveSampleRequested(self.sample_requested)?;
-
         Ok(())
     }
 }
@@ -1505,25 +1165,8 @@ impl VideoEncoder {
 impl Drop for VideoEncoder {
     #[inline]
     fn drop(&mut self) {
-        // Try to signal EOS, then **close** the channels before waiting.
-        self.signal_video_eos();
-        let _ = self.audio_sender.send(None);
-
-        // Close channels early in Drop too (same trick as in finish()).
-        let (dummy_tx_v, _dummy_rx_v) = mpsc::sync_channel::<Option<(VideoEncoderSource, TimeSpan)>>(1);
-        let (dummy_tx_a, _dummy_rx_a) = mpsc::channel::<Option<(AudioEncoderSource, TimeSpan)>>();
-
-        let old_v = std::mem::replace(&mut self.frame_sender, dummy_tx_v);
-        let old_a = std::mem::replace(&mut self.audio_sender, dummy_tx_a);
-        drop(old_v);
-        drop(old_a);
-
-        if let Some(transcode_thread) = self.transcode_thread.take() {
-            let _ = transcode_thread.join();
-        }
-
-        let _ = self.media_stream_source.RemoveStarting(self.starting);
-        let _ = self.media_stream_source.RemoveSampleRequested(self.sample_requested);
+        let _ = unsafe { self.sink_writer.Finalize() };
+        let _ = unsafe { MFShutdown() };
     }
 }
 

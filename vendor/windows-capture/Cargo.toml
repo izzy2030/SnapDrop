@@ -59,6 +59,7 @@ features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "System_Threading",
+    "Win32_Media_MediaFoundation",
 ]
 
 [dependencies.windows-future]
