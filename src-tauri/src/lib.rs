@@ -95,6 +95,7 @@ pub mod test_helpers {
     pub use crate::capture::{capture_monitor, capture_region, ImageBuf};
     pub use crate::filename::encode_png;
     pub use crate::monitors::{enumerate as enumerate_monitors, MonitorInfo};
+    pub use crate::video_recording::record_headless;
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

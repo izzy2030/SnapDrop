@@ -637,6 +637,58 @@ pub fn start_recording(
     }
 }
 
+/// Start, run and stop a recording without a Tauri app.
+///
+/// Used by the `video_smoke` example (re-exported through `test_helpers`) to
+/// exercise the real capture -> GPU crop -> encode -> audio pump -> finalize
+/// pipeline headlessly. Everything below `start_free_threaded` is production
+/// code; only the Tauri window/tray/toolbar orchestration is skipped.
+pub fn record_headless(
+    region: RECT,
+    monitor: Monitor,
+    path: String,
+    fps: u32,
+    secs: u64,
+    log_path: Option<String>,
+) -> Result<RecordingResult, String> {
+    if let Some(p) = log_path {
+        crate::debuglog::init_path(std::path::PathBuf::from(p));
+    }
+    let fps = fps.clamp(5, 60);
+    let mw = monitor.width().map_err(|e| e.to_string())? as i32;
+    let mh = monitor.height().map_err(|e| e.to_string())? as i32;
+    let monitor_rect = RECT { left: 0, top: 0, right: mw, bottom: mh };
+
+    let settings = Settings::new(
+        monitor,
+        CursorCaptureSettings::Default,
+        DrawBorderSettings::WithoutBorder,
+        SecondaryWindowSettings::Default,
+        MinimumUpdateIntervalSettings::Custom(Duration::from_nanos(1_000_000_000 / fps as u64)),
+        DirtyRegionSettings::Default,
+        ColorFormat::Bgra8,
+        RecorderFlags { region, monitor_rect, output_path: path.clone(), fps },
+    );
+
+    let control = VideoSession::start_free_threaded(settings).map_err(|e| e.to_string())?;
+    ACTIVE.store(true, Ordering::SeqCst);
+    debuglog::log(&format!("video: headless start -> {path}"));
+
+    std::thread::sleep(Duration::from_secs(secs));
+
+    let session = control.callback();
+    {
+        let mut cb = session.lock();
+        cb.stop_requested.store(true, Ordering::SeqCst);
+        cb.stop_time = Some(Instant::now());
+    }
+    let _: Result<(), _> = control.stop();
+    debuglog::log("video: headless — capture thread joined");
+    let result = session.lock().finalize();
+    ACTIVE.store(false, Ordering::SeqCst);
+    Ok(result)
+}
+
 /// Stop the active recording. The handler finalizes on its next frame and
 /// stops the WGC thread; we join it and return the result.
 pub fn stop_recording(app: &tauri::AppHandle) -> Result<RecordingResult, String> {

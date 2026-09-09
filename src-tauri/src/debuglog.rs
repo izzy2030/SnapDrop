@@ -43,9 +43,17 @@ pub fn init(app: &tauri::AppHandle) {
         .path()
         .app_config_dir()
         .unwrap_or_else(|_| PathBuf::from("."));
-    let path = dir.join("snapdrop-debug.log");
+    init_path(dir.join("snapdrop-debug.log"));
+}
+
+/// Point the logger at an explicit file and rotate whatever was there.
+///
+/// The app calls `init` (which delegates here). Headless harnesses have no
+/// `AppHandle`, so they call this directly — otherwise `log` stays a no-op and
+/// the recorder's health / audio-pump lines are never written anywhere.
+pub fn init_path(path: PathBuf) {
     if path.exists() {
-        let prev = dir.join("snapdrop-debug.prev.log");
+        let prev = path.with_extension("prev.log");
         let _ = std::fs::remove_file(&prev);
         let _ = std::fs::rename(&path, &prev);
     }
