@@ -86,12 +86,12 @@ impl Default for Settings {
             capture_delay_secs: 3,
             last_area_hotkey: "Ctrl+Alt+L".into(),
             video_hotkey: "Ctrl+Alt+V".into(),
-            // Default to 60fps: the Media Foundation H.264 encoder on this
-            // system sustains ~36fps real-time at 60 request and ~24fps at 30
-            // request. The higher request rate yields shorter intervals between
-            // unique frames (~27ms vs ~40ms), which feels smoother despite more
-            // CFR padding. Users can dial back to 30 in Settings if their
-            // system handles it differently.
+            // Default to 60fps to get the highest effective rate the system
+            // can sustain. The encoder outputs VFR (Variable Frame Rate) so
+            // the file stores each frame at its real timestamp — no CFR padding
+            // or frame duplication. On this system that yields ~36fps real at
+            // 60 request vs ~24fps at 30 request. Users can dial back to 30 in
+            // Settings if they prefer lower CPU/GPU load.
             video_fps: 60,
             last_area: None,
         }
