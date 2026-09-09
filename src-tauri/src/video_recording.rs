@@ -76,6 +76,8 @@ pub struct RecorderFlags {
     /// Capture rate (frames per second). Clamped to 5–60 in `start_recording`;
     /// threaded through so the encoder declares the SAME rate it is fed.
     pub fps: u32,
+    /// If true, skip audio capture entirely (used by headless benchmarks).
+    pub audio_disabled: bool,
 }
 
 /// Outcome of a finished recording session.
@@ -235,7 +237,7 @@ impl GraphicsCaptureApiHandler for VideoSession {
     type Error = RecorderError;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-        let RecorderFlags { region, monitor_rect, output_path, fps } = ctx.flags.clone();
+        let RecorderFlags { region, monitor_rect, output_path, fps, audio_disabled } = ctx.flags.clone();
         // Round DOWN to even; H.264/HEVC and Media Foundation require even
         // geometry. `w & !1` clears the lowest bit.
         let w = (region.right - region.left).max(2) as u32 & !1;
@@ -262,11 +264,17 @@ impl GraphicsCaptureApiHandler for VideoSession {
             ContainerSettingsBuilder::default(),
             &output_path,
         )?;
-        let audio = audio::AudioLoopback::start();
-        debuglog::log(&format!(
-            "video: audio capture {}",
-            if audio.is_some() { "ready" } else { "unavailable (recording silent)" }
-        ));
+        let audio = if audio_disabled {
+            debuglog::log("video: audio disabled (headless benchmark)");
+            None
+        } else {
+            let a = audio::AudioLoopback::start();
+            debuglog::log(&format!(
+                "video: audio capture {}",
+                if a.is_some() { "ready" } else { "unavailable (recording silent)" }
+            ));
+            a
+        };
         Ok(VideoSession {
             encoder: Arc::new(Mutex::new(Some(encoder))),
             audio,
@@ -581,7 +589,7 @@ pub fn start_recording(
     // HMONITOR is `*mut c_void`; Monitor wraps it and is `unsafe impl Send`.
     let item_monitor = Monitor::from_raw_hmonitor(monitor.hmonitor.0);
 
-    let flags = RecorderFlags { region, monitor_rect, output_path: path.clone(), fps };
+    let flags = RecorderFlags { region, monitor_rect, output_path: path.clone(), fps, audio_disabled: false };
 
     let settings = Settings::new(
         item_monitor,
@@ -650,6 +658,7 @@ pub fn record_headless(
     fps: u32,
     secs: u64,
     log_path: Option<String>,
+    audio_disabled: bool,
 ) -> Result<RecordingResult, String> {
     if let Some(p) = log_path {
         crate::debuglog::init_path(std::path::PathBuf::from(p));
@@ -667,7 +676,7 @@ pub fn record_headless(
         MinimumUpdateIntervalSettings::Custom(Duration::from_nanos(1_000_000_000 / fps as u64)),
         DirtyRegionSettings::Default,
         ColorFormat::Bgra8,
-        RecorderFlags { region, monitor_rect, output_path: path.clone(), fps },
+        RecorderFlags { region, monitor_rect, output_path: path.clone(), fps, audio_disabled },
     );
 
     let control = VideoSession::start_free_threaded(settings).map_err(|e| e.to_string())?;

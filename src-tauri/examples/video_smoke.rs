@@ -55,6 +55,7 @@ fn main() {
         fps,
         secs,
         Some(log.to_string_lossy().to_string()),
+        false, // audio enabled
     );
     let wall = start.elapsed().as_secs_f64();
 
