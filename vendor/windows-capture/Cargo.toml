@@ -12,6 +12,12 @@ resolver = "3"
 name = "windows_capture"
 path = "src/lib.rs"
 
+# A/B harness comparing the GPU region crop against the original CPU
+# crop+flip path. Not built as part of the app.
+[[example]]
+name = "region_bench"
+path = "examples/region_bench.rs"
+
 [dependencies.parking_lot]
 version = "0.12.5"
 

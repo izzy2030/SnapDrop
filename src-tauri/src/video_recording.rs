@@ -348,8 +348,15 @@ impl GraphicsCaptureApiHandler for VideoSession {
             let mut guard = self.encoder.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(enc) = guard.as_mut() {
                 if self.use_gpu {
+                    // `send_frame_region` reports Ok even when backpressure
+                    // shed the sample, so compare the shed counter to learn
+                    // whether this frame actually reached the encoder.
+                    // Counting shed frames as sent would make the health log
+                    // report the target rate while the file quietly misses
+                    // them — hiding the very problem we're measuring.
+                    let before = enc.dropped_frames();
                     match enc.send_frame_region(frame, ox, oy, ts) {
-                        Ok(()) => sent = true,
+                        Ok(()) => sent = enc.dropped_frames() == before,
                         Err(e) => {
                             debuglog::log(&format!(
                                 "video: GPU crop failed ({e}); falling back to the CPU path"
