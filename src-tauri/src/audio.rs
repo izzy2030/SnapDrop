@@ -45,8 +45,6 @@ pub struct AudioLoopback {
     rx: Receiver<Vec<u8>>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
-    /// Total PCM bytes captured (for diagnostics).
-    bytes: u64,
 }
 
 impl AudioLoopback {
@@ -65,23 +63,17 @@ impl AudioLoopback {
             .name("wasapi-loopback".into())
             .spawn(move || run(tx, stop_thread))
             .ok()?;
-        Some(Self { rx, stop, handle: Some(handle), bytes: 0 })
+        Some(Self { rx, stop, handle: Some(handle) })
     }
 
     /// Non-blocking drain of any PCM packets queued so far.
     pub fn drain(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
         while let Ok(pkt) = self.rx.try_recv() {
-            self.bytes += pkt.len() as u64;
             out.extend_from_slice(&pkt);
         }
         out
     }
-
-    pub fn bytes_captured(&self) -> u64 {
-        self.bytes
-    }
-
 
     /// Stop the capture thread and wait for it to exit.
     pub fn stop(&mut self) {

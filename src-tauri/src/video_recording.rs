@@ -1,19 +1,26 @@
 //! Proper video recording using Windows Graphics Capture (GPU-backed) + an MP4
-//! encoder via the `windows-capture` crate.
+//! encoder via the vendored, patched `windows-capture` crate.
 //!
-//! Design:
+//! See `vendor/windows-capture` for the crate-side changes. Pipeline:
 //! - `VideoSession::start_free_threaded` runs WGC on its own thread and returns
 //!   a `CaptureControl` that we hold in Tauri-managed state.
-//! - Every WGC frame is cropped to the selected region (`Frame::buffer_crop`),
-//!   converted from RGBA/top-down to BGRA/bottom-to-top, and pushed to a
-//!   `VideoEncoder` writing an MP4 file.
-//! - Stopping flips an `AtomicBool`; the handler sees it on its next frame,
-//!   finalizes the encoder, records the result, and calls
-//!   `capture_control.stop()`. The Stop command then joins the thread and reads
-//!   the result back via `CaptureControl::callback()`.
+//! - Every frame is cropped **on the GPU** (`send_frame_region`) and handed to
+//!   Media Foundation as a Direct3D surface: no readback, no row flip, no
+//!   per-frame allocation. A CPU crop+flip path remains as a fallback.
+//! - Timestamps come from WGC's own presentation clock, so playback spacing
+//!   reflects when frames were really shown instead of a synthetic grid.
+//! - The frame queue is bounded, so an encoder that falls behind sheds frames
+//!   rather than building an unbounded backlog.
+//! - System audio is fed by its own pump thread on its own clock, so it neither
+//!   starves nor drops when the screen is static (which used to drift A/V).
+//!
+//! Stopping flips an `AtomicBool`; the handler sees it on its next frame and
+//! calls `capture_control.stop()`. The Stop command then joins the thread,
+//! stops the audio pump, and finalizes the encoder on a helper thread.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -82,13 +89,109 @@ pub struct RecordingResult {
     pub height: u32,
 }
 
+/// Feeds system audio to the encoder on its own clock.
+///
+/// WGC only delivers a frame when the screen changes, so audio used to be fed
+/// solely from inside the frame callback. On a static screen nothing arrived,
+/// and because the encoder's audio timeline advances by samples *sent* (while
+/// the video timeline ran on wall-clock) the two drifted apart by however long
+/// the screen sat still. Running the feed on its own thread keeps the audio
+/// clock honest and independent of capture activity.
+struct AudioPump {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+    bytes: Arc<AtomicU64>,
+}
+
+impl AudioPump {
+    fn start(encoder: Arc<Mutex<Option<VideoEncoder>>>, mut loopback: audio::AudioLoopback) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let bytes = Arc::new(AtomicU64::new(0));
+        // Anything buffered between device start and the first video frame
+        // would otherwise lead the video by that much.
+        loopback.drain();
+        let spawned = std::thread::Builder::new()
+            .name("audio-pump".into())
+            .spawn({
+                let stop = stop.clone();
+                let bytes = bytes.clone();
+                move || audio_pump_main(encoder, loopback, stop, bytes)
+            });
+        match spawned {
+            Ok(handle) => Self { stop, handle: Some(handle), bytes },
+            Err(e) => {
+                debuglog::log(&format!("video: audio pump failed to start: {e}"));
+                Self { stop, handle: None, bytes }
+            }
+        }
+    }
+
+    /// Signals the pump to exit and waits for it. Idempotent.
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        debuglog::log(&format!(
+            "video: audio pump stopped after {} bytes",
+            self.bytes.load(Ordering::Relaxed)
+        ));
+    }
+}
+
+impl Drop for AudioPump {
+    fn drop(&mut self) {
+        // Join if the caller didn't stop() us, so the WASAPI thread and the
+        // audio device never linger detached.
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn audio_pump_main(
+    encoder: Arc<Mutex<Option<VideoEncoder>>>,
+    mut loopback: audio::AudioLoopback,
+    stop: Arc<AtomicBool>,
+    bytes: Arc<AtomicU64>,
+) {
+    let mut silence: Vec<u8> = Vec::new();
+    while !stop.load(Ordering::Relaxed) {
+        let pcm = loopback.drain();
+        // While paused feed NOTHING, so the audio timeline freezes alongside
+        // the video one and the two stay in sync across the pause.
+        if !pcm.is_empty() && !crate::toolbar::is_paused() {
+            if crate::toolbar::is_muted() {
+                // Silence of the same length keeps the timeline continuous (no
+                // A/V drift) while producing no sound.
+                if silence.len() < pcm.len() {
+                    silence.resize(pcm.len(), 0);
+                }
+                if let Ok(mut guard) = encoder.lock() {
+                    if let Some(enc) = guard.as_mut() {
+                        let _ = enc.send_audio_buffer(&silence[..pcm.len()], 0);
+                    }
+                }
+            } else if let Ok(mut guard) = encoder.lock() {
+                if let Some(enc) = guard.as_mut() {
+                    let _ = enc.send_audio_buffer(&pcm, 0);
+                }
+            }
+            bytes.fetch_add(pcm.len() as u64, Ordering::Relaxed);
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    loopback.stop();
+}
 
 /// WGC handler created fresh on the capture thread for every session.
 struct VideoSession {
-    encoder: Option<VideoEncoder>,
-    /// System-audio loopback capture (output mix). `None` if no audio device
-    /// was available; recording proceeds without sound.
+    /// Shared with the audio pump so PCM can be fed independently of capture.
+    encoder: Arc<Mutex<Option<VideoEncoder>>>,
+    /// Held until the first frame arrives, then moved into the pump thread.
     audio: Option<audio::AudioLoopback>,
+    audio_pump: Option<AudioPump>,
     region: RECT,
     monitor_rect: RECT,
     /// Even encoder/crop width (H.264/Media Foundation needs even dims).
@@ -102,30 +205,28 @@ struct VideoSession {
     /// stop+finalize latency (the encoder is finaled later, on another thread).
     stop_time: Option<Instant>,
     stop_requested: Arc<AtomicBool>,
-    /// Accumulated "pause" wall-clock time. Subtracted from the running
-    /// elapsed when computing frame timestamps so the VIDEO timeline freezes
-    /// across a pause. (The audio timeline freezes naturally: while paused we
-    /// feed nothing, so the encode's audio sample counter stops advancing.)
-    /// Both freezing together keeps A/V in sync across the pause.
+    /// Accumulated "pause" wall-clock time, for the reported duration.
     paused_accum: Duration,
     /// True while a pause is in effect (this session's mirror of the global
     /// toolbar pause flag, with its transition tracked here).
     currently_paused: bool,
     /// Instant the current pause began, for computing `paused_accum` on resume.
     pause_started_at: Option<Instant>,
-    /// True until the first frame is sent — used to drop the PCM that
-    /// accumulated between audio start and the first video frame.
+    /// The same pause, measured in the WGC clock (100ns ticks) so it can be
+    /// subtracted from the frame timeline.
+    paused_wgc: i64,
+    pause_wgc_start: Option<i64>,
+    /// WGC timestamp of the first emitted frame — the timeline origin.
+    first_wgc_ts: Option<i64>,
+    /// True until the first frame is handled; gates the audio pump start.
     first_frame: bool,
-    /// Capture rate, used for the constant-frame-rate timestamp grid.
+    /// False once the GPU crop fails, after which we fall back to the CPU path.
+    use_gpu: bool,
+    /// Requested capture rate, for the declared frame rate and the health log.
     fps: u32,
-    /// Reused scratch buffer for the top-down -> bottom-up row flip. Allocating
-    /// a fresh Vec per frame (~8MB at 1080p) pressures the allocator and can
-    /// cost WGC frames under load; resizing in place keeps the allocation
-    /// across frames of the same size.
+    /// Scratch buffer for the CPU fallback's top-down -> bottom-up row flip.
+    /// Allocated once and resized in place.
     flip_buf: Vec<u8>,
-    /// Timestamp (100ns units) of the last emitted frame, for monotonic-grid
-    /// pacing when delivery is slower than the declared frame rate.
-    last_frame_ts: i64,
     result: RecordingResult,
 }
 
@@ -142,23 +243,21 @@ impl GraphicsCaptureApiHandler for VideoSession {
         debuglog::log(&format!("video: handler new {}x{} @{}fps -> {}", w, h, fps, output_path));
         // Declare the SAME rate we feed. The builder's default is 60fps; if we
         // leave it, the MP4/encoder think the stream is 60fps while we send 30
-        // frames/sec — Media Foundation paces on the declared rate and players
-        // read it, which shows up as stutter/judder in the output.
+        // frames/sec and players read that back as stutter.
         let encoder = VideoEncoder::new(
             VideoSettingsBuilder::new(w, h)
                 .sub_type(VideoSettingsSubType::H264)
                 .frame_rate(fps)
                 // Don't trust the 15 Mbps default (geared to 1080p60+). A
                 // bitrate far above a region's needs makes the encoder work
-                // harder per frame and it falls behind real-time, so
-                // MediaStreamSource drops frames to keep up — capping the
-                // output well below the requested fps. Scale to the actual
-                // pixels and rate: ~0.1 bit/pixel/frame is a high-quality
-                // bound, clamped to a sane 1.5–20 Mbps.
+                // harder per frame and it falls behind real-time, so the
+                // bounded queue starts shedding. Scale to the actual pixels
+                // and rate: ~0.1 bit/pixel/frame is a high-quality bound,
+                // clamped to a sane 1.5–20 Mbps.
                 .bitrate(video_bitrate_bps(w, h, fps)),
-            // System audio is enabled; PCM is fed continuously from the WASAPI
-            // loopback capture. 48 kHz / stereo / 16-bit is the encoder default
-            // and matches what `audio::AudioLoopback` delivers.
+            // System audio is enabled; PCM is fed continuously by the audio
+            // pump. 48 kHz / stereo / 16-bit is the encoder default and matches
+            // what `audio::AudioLoopback` delivers.
             AudioSettingsBuilder::default(),
             ContainerSettingsBuilder::default(),
             &output_path,
@@ -169,8 +268,9 @@ impl GraphicsCaptureApiHandler for VideoSession {
             if audio.is_some() { "ready" } else { "unavailable (recording silent)" }
         ));
         Ok(VideoSession {
-            encoder: Some(encoder),
+            encoder: Arc::new(Mutex::new(Some(encoder))),
             audio,
+            audio_pump: None,
             region,
             monitor_rect,
             enc_w: w,
@@ -183,10 +283,13 @@ impl GraphicsCaptureApiHandler for VideoSession {
             paused_accum: Duration::ZERO,
             currently_paused: false,
             pause_started_at: None,
+            paused_wgc: 0,
+            pause_wgc_start: None,
+            first_wgc_ts: None,
             first_frame: true,
+            use_gpu: true,
             fps,
             flip_buf: Vec::new(),
-            last_frame_ts: 0,
             result: RecordingResult::default(),
         })
     }
@@ -196,17 +299,27 @@ impl GraphicsCaptureApiHandler for VideoSession {
         frame: &mut Frame<'_>,
         capture_control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
-        // Track pause transitions from the global toolbar flag. While paused
-        // we feed the encoder NOTHING (no video frame, no audio), so both
-        // timelines stop advancing and stay in sync; on resume we subtract the
-        // paused wall-clock time so the file simply omits the paused period.
+        // Ground truth for when this frame was presented (QPC-derived 100ns
+        // ticks). The old code threw this away and reconstructed a timeline
+        // from wall-clock at push time, which baked every scheduler hiccup and
+        // driver stall into the playback spacing.
+        let wgc_ts = frame.timestamp()?.Duration;
+
+        // Track pause transitions from the global toolbar flag, in BOTH clocks:
+        // wall-clock for the reported duration, WGC time for the frame
+        // timeline. While paused we feed the encoder nothing, so both timelines
+        // freeze together and stay in sync.
         let pause_req = crate::toolbar::is_paused();
         if pause_req && !self.currently_paused {
             self.currently_paused = true;
             self.pause_started_at = Some(Instant::now());
+            self.pause_wgc_start = Some(wgc_ts);
         } else if !pause_req && self.currently_paused {
             if let Some(ps) = self.pause_started_at.take() {
                 self.paused_accum += ps.elapsed();
+            }
+            if let Some(pw) = self.pause_wgc_start.take() {
+                self.paused_wgc += wgc_ts.saturating_sub(pw);
             }
             self.currently_paused = false;
         }
@@ -219,66 +332,81 @@ impl GraphicsCaptureApiHandler for VideoSession {
             return Ok(());
         }
 
-        // Constant-frame-rate timeline driven by wall-clock, not frame count.
-        // Stamp each frame at the next grid point at-or-after real elapsed
-        // time, and never closer than one frame to the previous stamp (so
-        // timestamps stay strictly increasing and even-spaced even when the
-        // delivered rate lags the declared rate). With a 60fps request that's
-        // actually encoding at ~30fps, the older "nominal count vs snap-ahead"
-        // logic emitted alternating ~16ms/~50ms gaps — read as visible jump-
-        // ing. This always lands on the grid, giving even frame intervals at
-        // whatever rate the encoder sustains; the declared fps (same setting)
-        // is the only thing that should be set to match.
-        let frame_dur = (10_000_000u64 / self.fps.max(1) as u64) as i64; // 100ns ticks
-        // Elapsed wall-clock EXCLUDING accumulated pause time, so the video
-        // timeline resumes where it paused rather than jumping forward.
-        let elapsed = ((self.started.elapsed() - self.paused_accum).as_nanos() as u64 / 100) as i64;
-        // ceil(elapsed / frame_dur) * frame_dur, without the unstable div_ceil.
-        let snapped = ((elapsed + frame_dur - 1) / frame_dur) * frame_dur;
-        let ts = snapped.max(self.last_frame_ts + frame_dur);
-        self.last_frame_ts = ts;
-        // Crop to the region (rounded to even dimensions), relative to the monitor top-left.
+        // Timeline: real elapsed presentation time since the first frame, with
+        // paused spans removed so the file simply omits them. Frames land
+        // wherever they actually occurred — no grid snapping, so a late frame
+        // reads as a late frame instead of a doubled gap.
+        let base = *self.first_wgc_ts.get_or_insert(wgc_ts);
+        let ts = wgc_ts.saturating_sub(base).saturating_sub(self.paused_wgc).max(0);
+
+        // Crop origin, relative to the captured monitor's top-left.
         let ox = (self.region.left - self.monitor_rect.left).max(0) as u32;
         let oy = (self.region.top - self.monitor_rect.top).max(0) as u32;
-        let ex = ox + self.enc_w;
-        let ey = oy + self.enc_h;
-        let buf = frame.buffer_crop(ox, oy, ex, ey)?;
-        let h = buf.height();
-        let mut no_pad: Vec<u8> = Vec::new();
-        let bgra = buf.as_nopadding_buffer(&mut no_pad);
-        let row = buf.width() as usize * 4;
-        // Capture is now requested as Bgra8, so no per-pixel channel swap is
-        // needed. We only flip rows top-down -> bottom-to-top (which Windows /
-        // MF expect). Reuse the session's scratch buffer (resize in place)
-        // instead of allocating per frame.
-        self.flip_buf.resize(bgra.len(), 0);
-        for y in 0..h as usize {
-            let src = &bgra[y * row..(y + 1) * row];
-            let dst_row = (h as usize - 1 - y) * row;
-            self.flip_buf[dst_row..dst_row + row].copy_from_slice(src);
-        }
-        let flipped = &self.flip_buf[..];
-        if let Some(enc) = self.encoder.as_mut() {
-            enc.send_frame_buffer(flipped, ts)?;
-            self.frames += 1;
-            // Feed whatever system audio accumulated since the last frame.
-            // When muted, send silence of the same length so the audio
-            // timeline stays continuous (no A/V drift) but produces no sound.
-            if let Some(a) = self.audio.as_mut() {
-                let pcm = a.drain();
-                if self.first_frame {
-                    // Drop PCM buffered between audio start and the first video
-                    // frame so the audio track doesn't lead the video by a
-                    // frame or two (the WASAPI loopback starts in `new`, before
-                    // the first WGC frame lands).
-                    self.first_frame = false;
-                } else if !pcm.is_empty() {
-                    if crate::toolbar::is_muted() {
-                        enc.send_audio_buffer(&vec![0u8; pcm.len()], 0)?;
-                    } else {
-                        enc.send_audio_buffer(&pcm, 0)?;
+
+        let mut sent = false;
+        {
+            let mut guard = self.encoder.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(enc) = guard.as_mut() {
+                if self.use_gpu {
+                    match enc.send_frame_region(frame, ox, oy, ts) {
+                        Ok(()) => sent = true,
+                        Err(e) => {
+                            debuglog::log(&format!(
+                                "video: GPU crop failed ({e}); falling back to the CPU path"
+                            ));
+                            self.use_gpu = false;
+                        }
                     }
                 }
+                if !sent && ox + self.enc_w <= frame.width() && oy + self.enc_h <= frame.height() {
+                    // CPU fallback: read the crop back and flip it bottom-up.
+                    // (Only the raw-buffer path needs that flip — the surface
+                    // path above does not.) Regions that overhang the capture
+                    // texture can't be padded cheaply here, and the GPU path
+                    // already handles them, so those frames are skipped.
+                    let buf = frame.buffer_crop(ox, oy, ox + self.enc_w, oy + self.enc_h)?;
+                    let h = buf.height();
+                    let mut no_pad: Vec<u8> = Vec::new();
+                    let bgra = buf.as_nopadding_buffer(&mut no_pad);
+                    let row = buf.width() as usize * 4;
+                    self.flip_buf.resize(bgra.len(), 0);
+                    for y in 0..h as usize {
+                        let src = &bgra[y * row..(y + 1) * row];
+                        let dst_row = (h as usize - 1 - y) * row;
+                        self.flip_buf[dst_row..dst_row + row].copy_from_slice(src);
+                    }
+                    enc.send_frame_buffer(&self.flip_buf, ts)?;
+                    sent = true;
+                }
+            }
+        }
+        if sent {
+            self.frames += 1;
+
+            // Periodic health check. The whole point of the GPU path is a
+            // capture loop that keeps up, so surface the achieved rate and any
+            // backpressure shedding where it can actually be read. If
+            // "fps effective" sits well under the target, the encoder (not the
+            // capture) is the limit; if "shed" climbs, it has fallen behind.
+            if self.frames % 150 == 0 {
+                let secs = (self.started.elapsed() - self.paused_accum).as_secs_f64();
+                let rate = if secs > 0.0 { self.frames as f64 / secs } else { 0.0 };
+                debuglog::log(&format!(
+                    "video: health — {} frames, {:.1} fps effective (target {}), {} shed by backpressure",
+                    self.frames,
+                    rate,
+                    self.fps,
+                    self.dropped_count()
+                ));
+            }
+        }
+
+        // Open the audio gate on the first frame, so the audio clock starts
+        // together with the video timeline rather than at device-open time.
+        if self.first_frame {
+            self.first_frame = false;
+            if let Some(lb) = self.audio.take() {
+                self.audio_pump = Some(AudioPump::start(self.encoder.clone(), lb));
             }
         }
 
@@ -306,6 +434,14 @@ impl GraphicsCaptureApiHandler for VideoSession {
 
 
 impl VideoSession {
+    /// Frames the bounded queue shed because the encoder fell behind.
+    fn dropped_count(&self) -> u64 {
+        match self.encoder.lock() {
+            Ok(g) => g.as_ref().map(VideoEncoder::dropped_frames).unwrap_or(0),
+            Err(p) => p.into_inner().as_ref().map(VideoEncoder::dropped_frames).unwrap_or(0),
+        }
+    }
+
     /// Finalize the encoder and produce the result. Idempotent: a repeat call
     /// returns the already-computed result, and a call when nothing was taken
     /// is a no-op. The result is RETURNED (not left for the caller to read back
@@ -314,17 +450,21 @@ impl VideoSession {
     /// defeated the earlier timeout. Runs on whatever thread calls this; keep
     /// it off the main/UI thread.
     fn finalize(&mut self) -> RecordingResult {
-        if let Some(enc) = self.encoder.take() {
-            // Stop the audio capture FIRST: its thread must be joined and torn
-            // down even if the (GPU/Media Foundation) encoder finalize below
-            // hangs, so a stalled finalize can never leak the WASAPI thread.
-            // Safe because the WGC capture thread is already joined at this
-            // point — all PCM was already fed, so nothing is lost.
-            if let Some(a) = self.audio.take() {
-                let mut a = a;
-                a.stop();
-                debuglog::log(&format!("video: audio captured {} bytes", a.bytes_captured()));
-            }
+        // Stop the audio feed FIRST: its thread must be joined and torn down
+        // even if the (GPU/Media Foundation) encoder finalize below hangs, so a
+        // stalled finalize can never leak the WASAPI thread. Safe because the
+        // WGC capture thread is already joined at this point.
+        if let Some(mut pump) = self.audio_pump.take() {
+            pump.stop();
+        }
+        if let Some(mut a) = self.audio.take() {
+            // Never handed to a pump (no frames arrived at all).
+            a.stop();
+        }
+        // How many frames the bounded queue shed because the encoder lagged.
+        let dropped = self.dropped_count();
+        let mut guard = self.encoder.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(enc) = guard.take() {
             if let Err(e) = enc.finish() {
                 debuglog::log(&format!("video: encoder finish error: {e}"));
                 // A failed finish leaves the file truncated/unfinalized — don't
@@ -338,15 +478,15 @@ impl VideoSession {
                 // Exclude paused wall-clock time so the reported duration
                 // reflects the actual recording (the file omits the pause).
                 elapsed_ms: self
-                .stop_time
-                .map(|t| (t.duration_since(self.started) - self.paused_accum).as_millis())
-                .unwrap_or_else(|| (self.started.elapsed() - self.paused_accum).as_millis()),
+                    .stop_time
+                    .map(|t| (t.saturating_duration_since(self.started) - self.paused_accum).as_millis())
+                    .unwrap_or_else(|| (self.started.elapsed() - self.paused_accum).as_millis()),
                 width: self.enc_w,
                 height: self.enc_h,
             };
             debuglog::log(&format!(
-                "video: finished {} frames in {}ms -> {}",
-                self.result.frames, self.result.elapsed_ms, self.result.path
+                "video: finished {} frames in {}ms ({} shed by backpressure) -> {}",
+                self.result.frames, self.result.elapsed_ms, dropped, self.result.path
             ));
         }
         self.result.clone()
@@ -413,9 +553,9 @@ pub fn start_recording(
     path: String,
     fps: u32,
 ) -> Result<String, String> {
-    // Throttle WGC to the requested rate (clamped to a sane range). This is
-    // the main lever against the stutter: without it we capture+convert+frame
-    // at 60–144 Hz and the MF encoder can't keep real-time pace.
+    // Throttle WGC to the requested rate (clamped to a sane range). This keeps
+    // the capture/encode loop inside its real-time budget on high-refresh
+    // displays, where WGC would otherwise offer frames at 60–144 Hz.
     let fps = fps.clamp(5, 60);
     {
         let rec_state = app.state::<Mutex<VideoRecorder>>();
@@ -441,7 +581,10 @@ pub fn start_recording(
         CursorCaptureSettings::Default,
         DrawBorderSettings::WithoutBorder,
         SecondaryWindowSettings::Default,
-        MinimumUpdateIntervalSettings::Custom(Duration::from_millis(1000 / fps as u64)),
+        // Nanoseconds, not milliseconds: `from_millis(1000 / 30)` truncates to
+        // 33ms (30.3fps) and quietly desynchronises the requested rate from the
+        // rate the encoder is told to expect.
+        MinimumUpdateIntervalSettings::Custom(Duration::from_nanos(1_000_000_000 / fps as u64)),
         DirtyRegionSettings::Default,
         ColorFormat::Bgra8,
         flags,
@@ -531,7 +674,8 @@ pub fn stop_recording(app: &tauri::AppHandle) -> Result<RecordingResult, String>
     // result over the channel, so on timeout we fall back WITHOUT re-locking
     // the session (the old `session.lock().result.clone()` at this point is
     // what defeated the earlier timeout — it blocked on the same mutex the
-    // hung finalize holds). Normally finishes in ~1–2s; give it a budget.
+    // hung finalize holds). Now that the frame queue is bounded there is far
+    // less left to drain, so this is normally well under a second.
     let session_fin = session.clone();
     let (tx, rx) = std::sync::mpsc::channel::<RecordingResult>();
     std::thread::spawn(move || {

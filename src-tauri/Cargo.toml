@@ -53,3 +53,17 @@ windows = { version = "0.62", features = [
 ] }
 windows-core = "0.62"
 windows-capture = "2.0"
+
+# Vendored + patched fork of windows-capture 2.0.1 (see ../../vendor/windows-capture).
+#
+# Upstream only offers two ways to hand a frame to the encoder:
+#   * `send_frame_buffer` — a CPU path that forces a GPU->CPU readback, a
+#     per-frame staging-texture allocation, a blocking Map(), a row flip and
+#     two more copies per frame;
+#   * `send_frame` — a zero-copy GPU path, but it cannot crop, so a screen
+#     region would record the monitor's top-left corner.
+# The fork adds `send_frame_region()` (GPU-side crop with an arbitrary origin,
+# using the frame's real WGC presentation timestamp) and bounds the frame
+# queue so the encoder can never build an unbounded backlog.
+[patch.crates-io]
+windows-capture = { path = "../vendor/windows-capture" }
