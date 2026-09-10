@@ -631,9 +631,11 @@ pub async fn video_record_begin(app: AppHandle) -> Result<String, String> {
         let Some(p) = pending else {
             return Err("No region selected — press Ctrl+Alt+V first".to_string());
         };
-        // Capture rate from Settings (clamped 5–60 inside start_recording).
-        let fps = crate::settings::get(&app).video_fps;
-        match crate::video_recording::start_recording(&app, p.region, p.path, fps) {
+        // Capture rate and quality preset from Settings.
+        let settings = crate::settings::get(&app);
+        let fps = settings.video_fps;
+        let quality = settings.video_quality;
+        match crate::video_recording::start_recording(&app, p.region, p.path, fps, quality) {
             Ok(path) => Ok(path),
             Err(e) => {
                 // Start failed (e.g. the monitor was unplugged). The pending

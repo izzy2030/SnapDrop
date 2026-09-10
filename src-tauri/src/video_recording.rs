@@ -50,14 +50,19 @@ pub fn is_recording_active() -> bool {
     ACTIVE.load(Ordering::SeqCst)
 }
 
-/// Target encode bitrate for a region, in bits/second. High bitrate makes the
-/// encoder fall behind real-time and drop frames (see `new`), so scale it to
-/// the actual pixels and frame rate instead of the crate's 15 Mbps blanket
-/// default. ~0.1 bit/pixel/frame is a strong quality bound; clamp to a sane
-/// 1.5–20 Mbps so tiny and huge regions both stay reasonable.
-pub fn video_bitrate_bps(w: u32, h: u32, fps: u32) -> u32 {
-    let raw = (w as u64) * (h as u64) * (fps as u64) / 10; // 0.1 bit/pixel/frame
-    raw.clamp(1_500_000, 20_000_000) as u32
+/// Target encode bitrate for a region, in bits/second, scaled by quality preset.
+///
+/// - "720p": High-efficiency profile (~0.125 bpp, clamped 2–8 Mbps).
+/// - "1080p": Full HD balanced profile (~0.20 bpp, clamped 3–18 Mbps).
+/// - "4k" / "original": Maximum quality profile (~0.25 bpp, clamped 6–35 Mbps).
+pub fn video_bitrate_bps(w: u32, h: u32, fps: u32, quality: &str) -> u32 {
+    let (bpp_divisor, min_bps, max_bps) = match quality {
+        "720p" => (8, 2_000_000, 8_000_000),
+        "4k" | "original" => (4, 6_000_000, 35_000_000),
+        _ => (5, 3_000_000, 18_000_000), // "1080p" default
+    };
+    let raw = (w as u64) * (h as u64) * (fps as u64) / bpp_divisor;
+    raw.clamp(min_bps, max_bps) as u32
 }
 
 /// Flags threaded into the handler via `Settings`. Must be `Send`; it uses
@@ -76,6 +81,8 @@ pub struct RecorderFlags {
     /// Capture rate (frames per second). Clamped to 5–60 in `start_recording`;
     /// threaded through so the encoder declares the SAME rate it is fed.
     pub fps: u32,
+    /// Quality preset: "720p" | "1080p" | "4k".
+    pub quality: String,
     /// If true, skip audio capture entirely (used by headless benchmarks).
     pub audio_disabled: bool,
 }
@@ -226,9 +233,9 @@ struct VideoSession {
     use_gpu: bool,
     /// Requested capture rate, for the declared frame rate and the health log.
     fps: u32,
-    /// Scratch buffer for the CPU fallback's top-down -> bottom-up row flip.
+    /// Scratch buffer for the CPU fallback's unpadded row packing (if required).
     /// Allocated once and resized in place.
-    flip_buf: Vec<u8>,
+    cpu_buf: Vec<u8>,
     result: RecordingResult,
 }
 
@@ -237,12 +244,12 @@ impl GraphicsCaptureApiHandler for VideoSession {
     type Error = RecorderError;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-        let RecorderFlags { region, monitor_rect, output_path, fps, audio_disabled } = ctx.flags.clone();
+        let RecorderFlags { region, monitor_rect, output_path, fps, quality, audio_disabled } = ctx.flags.clone();
         // Round DOWN to even; H.264/HEVC and Media Foundation require even
         // geometry. `w & !1` clears the lowest bit.
         let w = (region.right - region.left).max(2) as u32 & !1;
         let h = (region.bottom - region.top).max(2) as u32 & !1;
-        debuglog::log(&format!("video: handler new {}x{} @{}fps -> {}", w, h, fps, output_path));
+        debuglog::log(&format!("video: handler new {}x{} @{}fps [{}] -> {}", w, h, fps, quality, output_path));
         // Declare the SAME rate we feed. The builder's default is 60fps; if we
         // leave it, the MP4/encoder think the stream is 60fps while we send 30
         // frames/sec and players read that back as stutter.
@@ -250,13 +257,7 @@ impl GraphicsCaptureApiHandler for VideoSession {
             VideoSettingsBuilder::new(w, h)
                 .sub_type(VideoSettingsSubType::H264)
                 .frame_rate(fps)
-                // Don't trust the 15 Mbps default (geared to 1080p60+). A
-                // bitrate far above a region's needs makes the encoder work
-                // harder per frame and it falls behind real-time, so the
-                // bounded queue starts shedding. Scale to the actual pixels
-                // and rate: ~0.1 bit/pixel/frame is a high-quality bound,
-                // clamped to a sane 1.5–20 Mbps.
-                .bitrate(video_bitrate_bps(w, h, fps)),
+                .bitrate(video_bitrate_bps(w, h, fps, &quality)),
             // System audio is enabled; PCM is fed continuously by the audio
             // pump. 48 kHz / stereo / 16-bit is the encoder default and matches
             // what `audio::AudioLoopback` delivers.
@@ -297,7 +298,7 @@ impl GraphicsCaptureApiHandler for VideoSession {
             first_frame: true,
             use_gpu: true,
             fps,
-            flip_buf: Vec::new(),
+            cpu_buf: Vec::new(),
             result: RecordingResult::default(),
         })
     }
@@ -374,23 +375,12 @@ impl GraphicsCaptureApiHandler for VideoSession {
                     }
                 }
                 if !sent && ox + self.enc_w <= frame.width() && oy + self.enc_h <= frame.height() {
-                    // CPU fallback: read the crop back and flip it bottom-up.
-                    // (Only the raw-buffer path needs that flip — the surface
-                    // path above does not.) Regions that overhang the capture
-                    // texture can't be padded cheaply here, and the GPU path
-                    // already handles them, so those frames are skipped.
+                    // CPU fallback: read the crop back without row inversion.
+                    // Regions that overhang the capture texture can't be padded cheaply
+                    // here, and the GPU path already handles them, so those frames are skipped.
                     let buf = frame.buffer_crop(ox, oy, ox + self.enc_w, oy + self.enc_h)?;
-                    let h = buf.height();
-                    let mut no_pad: Vec<u8> = Vec::new();
-                    let bgra = buf.as_nopadding_buffer(&mut no_pad);
-                    let row = buf.width() as usize * 4;
-                    self.flip_buf.resize(bgra.len(), 0);
-                    for y in 0..h as usize {
-                        let src = &bgra[y * row..(y + 1) * row];
-                        let dst_row = (h as usize - 1 - y) * row;
-                        self.flip_buf[dst_row..dst_row + row].copy_from_slice(src);
-                    }
-                    enc.send_frame_buffer(&self.flip_buf, ts)?;
+                    let bgra = buf.as_nopadding_buffer(&mut self.cpu_buf);
+                    enc.send_frame_buffer(bgra, ts)?;
                     sent = true;
                 }
             }
@@ -567,6 +557,7 @@ pub fn start_recording(
     region: RECT,
     path: String,
     fps: u32,
+    quality: String,
 ) -> Result<String, String> {
     // Throttle WGC to the requested rate (clamped to a sane range). This keeps
     // the capture/encode loop inside its real-time budget on high-refresh
@@ -589,7 +580,7 @@ pub fn start_recording(
     // HMONITOR is `*mut c_void`; Monitor wraps it and is `unsafe impl Send`.
     let item_monitor = Monitor::from_raw_hmonitor(monitor.hmonitor.0);
 
-    let flags = RecorderFlags { region, monitor_rect, output_path: path.clone(), fps, audio_disabled: false };
+    let flags = RecorderFlags { region, monitor_rect, output_path: path.clone(), fps, quality, audio_disabled: false };
 
     let settings = Settings::new(
         item_monitor,
@@ -659,11 +650,13 @@ pub fn record_headless(
     secs: u64,
     log_path: Option<String>,
     audio_disabled: bool,
+    quality: Option<String>,
 ) -> Result<RecordingResult, String> {
     if let Some(p) = log_path {
         crate::debuglog::init_path(std::path::PathBuf::from(p));
     }
     let fps = fps.clamp(5, 60);
+    let quality = quality.unwrap_or_else(|| "1080p".to_string());
     let mw = monitor.width().map_err(|e| e.to_string())? as i32;
     let mh = monitor.height().map_err(|e| e.to_string())? as i32;
     let monitor_rect = RECT { left: 0, top: 0, right: mw, bottom: mh };
@@ -676,7 +669,7 @@ pub fn record_headless(
         MinimumUpdateIntervalSettings::Custom(Duration::from_nanos(1_000_000_000 / fps as u64)),
         DirtyRegionSettings::Default,
         ColorFormat::Bgra8,
-        RecorderFlags { region, monitor_rect, output_path: path.clone(), fps, audio_disabled },
+        RecorderFlags { region, monitor_rect, output_path: path.clone(), fps, quality, audio_disabled },
     );
 
     let control = VideoSession::start_free_threaded(settings).map_err(|e| e.to_string())?;

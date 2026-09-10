@@ -14,7 +14,9 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::IDXGISurface;
 use windows::Win32::Media::MediaFoundation::*;
-use windows::Win32::System::WinRT::Direct3D11::CreateDirect3D11SurfaceFromDXGISurface;
+use windows::Win32::System::WinRT::Direct3D11::{
+    CreateDirect3D11SurfaceFromDXGISurface, IDirect3DDxgiInterfaceAccess,
+};
 use windows::core::{HSTRING, Interface};
 
 use crate::d3d11::SendDirectX;
@@ -710,8 +712,16 @@ impl VideoEncoder {
         let path = path.as_ref();
         let path_hstring = HSTRING::from(path.as_os_str());
 
+        let attributes = unsafe {
+            let mut attrs = None;
+            MFCreateAttributes(&mut attrs, 1)?;
+            let attrs = attrs.unwrap();
+            attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
+            attrs
+        };
+
         let sink_writer: IMFSinkWriter = unsafe {
-            MFCreateSinkWriterFromURL(&path_hstring, None, None)?
+            MFCreateSinkWriterFromURL(&path_hstring, None, Some(&attributes))?
         };
 
         // ---- Video output type (H.264) ----
@@ -724,6 +734,7 @@ impl VideoEncoder {
             video_out.SetUINT64(&MF_MT_FRAME_SIZE, ((target_width as u64) << 32) | target_height as u64)?;
             video_out.SetUINT64(&MF_MT_FRAME_RATE, ((target_fps as u64) << 32) | 1)?;
             video_out.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1u64 << 32) | 1)?;
+            video_out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
         }
 
         let video_stream_index = unsafe { sink_writer.AddStream(&video_out)? };
@@ -944,16 +955,20 @@ impl VideoEncoder {
 
         match source {
             VideoEncoderSource::DirectX(surface) => {
-                let dxgi: IDXGISurface = surface.0.cast()?;
+                let dxgi_interface: IDirect3DDxgiInterfaceAccess = surface.0.cast()?;
+                let texture: ID3D11Texture2D = unsafe { dxgi_interface.GetInterface::<ID3D11Texture2D>()? };
                 let media_buffer = unsafe {
                     MFCreateDXGISurfaceBuffer(
-                        &IDXGISurface::IID,
-                        &dxgi,
+                        &ID3D11Texture2D::IID,
+                        &texture,
                         0,
                         false,
                     )?
                 };
+                let two_d: IMF2DBuffer = media_buffer.cast()?;
                 unsafe {
+                    let length = two_d.GetContiguousLength()?;
+                    media_buffer.SetCurrentLength(length)?;
                     sample.AddBuffer(&media_buffer)?;
                 }
             }

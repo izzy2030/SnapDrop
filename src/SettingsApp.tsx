@@ -1183,6 +1183,20 @@ export default function SettingsApp() {
                   </div>
 
                   <div className="field">
+                    <span className="field-label">Video Resolution / Quality</span>
+                    <span className="field-hint">Target recording quality. 1080p is recommended for balanced, sharp footage. 4K / Original maximizes bitrate for high-resolution screens and movie captures.</span>
+                    <select
+                      style={{ marginTop: 6 }}
+                      value={settings.video_quality ?? "1080p"}
+                      onChange={(e) => set({ video_quality: e.target.value })}
+                    >
+                      <option value="720p">720p HD (High Efficiency — up to 8 Mbps)</option>
+                      <option value="1080p">1080p Full HD (Balanced — up to 18 Mbps)</option>
+                      <option value="4k">4K / Original (Maximum Quality — up to 35 Mbps)</option>
+                    </select>
+                  </div>
+
+                  <div className="field">
                     <span className="field-label">Screenshot Directory</span>
                     <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
                       <input

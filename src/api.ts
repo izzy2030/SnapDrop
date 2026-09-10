@@ -22,6 +22,7 @@ export interface Settings {
   last_area_hotkey: string;
   video_hotkey: string;
   video_fps: number;
+  video_quality?: string;
   last_area: { x: number; y: number; width: number; height: number } | null;
 }
 

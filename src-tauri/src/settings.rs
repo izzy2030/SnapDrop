@@ -47,6 +47,8 @@ pub struct Settings {
     pub video_hotkey: String,
     /// Capture rate for video recording (frames per second).
     pub video_fps: u32,
+    /// Video quality / resolution preset: "720p" | "1080p" | "4k".
+    pub video_quality: String,
     /// The most recently captured region (virtual-screen coords). Seeded by
     /// every image capture; None until the first screenshot.
     pub last_area: Option<LastArea>,
@@ -93,6 +95,7 @@ impl Default for Settings {
             // 60 request vs ~24fps at 30 request. Users can dial back to 30 in
             // Settings if they prefer lower CPU/GPU load.
             video_fps: 60,
+            video_quality: "1080p".into(),
             last_area: None,
         }
     }
