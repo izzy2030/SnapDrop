@@ -332,7 +332,10 @@ fn build_drag_image(path: &str) -> Option<(HBITMAP, HDC, SIZE, POINT)> {
             bmiColors: [Default::default()],
         };
         let bmp = CreateDIBSection(Some(hdc), &bi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
-        let _ = SelectObject(hdc, bmp.into());
+        // Deselect before returning: the caller deletes the bitmap, and
+        // deleting a bitmap still selected into a DC fails (leaking one GDI
+        // handle per drag — exhaustion over days of use).
+        let old = SelectObject(hdc, bmp.into());
         let px = std::slice::from_raw_parts_mut(bits as *mut u32, (actual_tw * actual_th) as usize);
         for (i, p) in rgba.chunks_exact(4).enumerate() {
             let (r, g, b, a) = (p[0] as u32, p[1] as u32, p[2] as u32, p[3] as u32);
@@ -350,6 +353,7 @@ fn build_drag_image(path: &str) -> Option<(HBITMAP, HDC, SIZE, POINT)> {
             x: -(actual_tw as i32 / 2),
             y: -(actual_th as i32 / 2),
         };
+        SelectObject(hdc, old);
         Some((bmp, hdc, size, offset))
     }
 }

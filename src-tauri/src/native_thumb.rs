@@ -7,7 +7,9 @@
 //! entire bug class is gone by construction.
 //!
 //! Behavior parity with the webview renderer (`ThumbnailApp.tsx`):
-//! - stack of up to 10 captures; older ones peek out behind the current card
+//! - stack of up to 10 captures (click to expand into a list); only the
+//!   current card is painted — older captures never peek out behind it, so a
+//!   stale "previous shot" ghost is impossible by construction
 //! - left press → native OLE drag of the file (runs on the Tauri main thread,
 //!   exactly like the webview path — `dragdrop::start_drag` polls for real
 //!   cursor movement, so a plain click never starts a drag)
@@ -54,8 +56,6 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 const WM_APP_CMD: u32 = WM_APP + 1;
 const WM_APP_TIMER: u32 = WM_APP + 2;
 
-/// Extra physical pixels below the card so older captures can peek out.
-const PEEK_SPACE: i32 = 20;
 /// Height of a row in the expanded list (physical px).
 const ROW_H: i32 = 48;
 /// Height of the filename caption bar (physical px).
@@ -153,12 +153,17 @@ fn hwnd_from(raw: isize) -> HWND {
 }
 
 /// Stack insertion policy: dedupe by capture id, newest first, cap at 10.
+/// Evicted ids leave `seen` so the set stays bounded over days of use.
 fn stack_push(stack: &mut Vec<Entry>, seen: &mut HashSet<u64>, entry: Entry) -> bool {
     if entry.capture_id == 0 || entry.bits.is_none() || !seen.insert(entry.capture_id) {
         return false;
     }
     stack.insert(0, entry);
-    stack.truncate(10);
+    if stack.len() > 10 {
+        for evicted in stack.drain(10..) {
+            seen.remove(&evicted.capture_id);
+        }
+    }
     true
 }
 
@@ -383,6 +388,7 @@ unsafe fn handle_cmd(hwnd: HWND, cmd: Cmd) {
             if !added {
                 // Duplicate capture id: keep showing what's already there.
                 show_at(hwnd, current_window_size(), pos);
+                let _ = InvalidateRect(Some(hwnd), None, false);
                 return;
             }
             show_at(hwnd, current_window_size(), pos);
@@ -399,6 +405,7 @@ unsafe fn handle_cmd(hwnd: HWND, cmd: Cmd) {
         Cmd::Show => {
             let pos = state().lock().unwrap().pos;
             show_at(hwnd, current_window_size(), pos);
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
         Cmd::Open(path) => {
             if let Some(handle) = APP.get().cloned() {
@@ -463,7 +470,7 @@ fn current_window_size() -> (i32, i32) {
     } else {
         0
     };
-    (st.card_w, st.card_h + PEEK_SPACE + rows)
+    (st.card_w, st.card_h + rows)
 }
 
 unsafe fn show_at(hwnd: HWND, size: (i32, i32), pos: Option<(i32, i32)>) {
@@ -702,21 +709,8 @@ unsafe fn draw_scene(dc: HDC, w: i32, h: i32) {
         (st.card_w, st.card_h, st.expanded, st.stack.len())
     };
 
-    // Peeking older captures: stack[1] at 95%/9px, stack[2] at 90%/18px.
-    let peek_specs = [(1usize, 0.95f64, 9i32), (2, 0.90, 18)];
-    for (idx, scale, off) in peek_specs {
-        if idx >= len {
-            continue;
-        }
-        let pw = (cw as f64 * scale).round() as i32;
-        let ph = (ch as f64 * scale).round() as i32;
-        let x = (cw - pw) / 2;
-        let y = (ch - ph) / 2 + off;
-        let rect = RECT { left: x, top: y, right: x + pw, bottom: y + ph };
-        fill(dc, &rect, PEEK_BG);
-        draw_entry_image(dc, idx, x, y, pw, ph);
-        frame(dc, &rect, BORDER);
-    }
+    // Current card only — older captures live in the stack for the expanded
+    // list but are never painted behind the card (no ghost).
 
     // Current card.
     let card = RECT { left: 0, top: 0, right: cw, bottom: ch };
@@ -910,6 +904,10 @@ mod tests {
         }
         assert_eq!(stack.len(), 10);
         assert_eq!(stack[0].capture_id, 15);
+        // Evicted ids leave `seen` so it stays bounded over days of use.
+        assert!(!seen.contains(&1));
+        assert!(!seen.contains(&5));
+        assert!(seen.contains(&15));
     }
 
     #[test]
