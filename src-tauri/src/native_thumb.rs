@@ -601,9 +601,17 @@ fn plan_drag_outcome(
     can_expand: bool,
 ) -> DropAction {
     if removed {
-        if stack_empty {
+        if dropped && hide_after_drop {
+            // A completed drop dismisses the window even when older,
+            // never-dragged captures remain in the stack: with single-card
+            // settings the user never asked to see them, and re-showing the
+            // top stale card is the recurring previous-shot ghost.
+            DropAction::Hide
+        } else if stack_empty {
             DropAction::Hide
         } else {
+            // Deck mode (hide_after_drop=false) or a cancelled drag: fall
+            // back to the next card so nothing in flight is lost.
             DropAction::Reshow
         }
     } else if dropped && hide_after_drop {
@@ -618,9 +626,10 @@ fn plan_drag_outcome(
 }
 
 /// Apply a finished drag's outcome: retire the card on any successful drop
-/// (moved or not — a press+release can still complete as a drop), hide on an
-/// empty stack or a successful drop (per settings), and toggle the expanded
-/// list on a plain click (press + release without movement or drop).
+/// (moved or not — a press+release can still complete as a drop), hide on a
+/// successful drop (per settings, even with older cards left — re-showing a
+/// stale one is the recurring ghost) or an empty stack, and toggle the
+/// expanded list on a plain click (press + release without movement or drop).
 fn handle_drag_outcome(
     hwnd: HWND,
     capture_id: u64,
@@ -1005,9 +1014,20 @@ mod tests {
             plan_drag_outcome(true, true, true, true, true, false),
             DropAction::Hide
         );
-        // Moved drop with older cards left -> reshow the next one.
+        // Moved drop with hide_after_drop and older cards left -> still hide:
+        // re-showing the top stale card is the recurring previous-shot ghost.
         assert_eq!(
             plan_drag_outcome(true, false, true, true, true, false),
+            DropAction::Hide
+        );
+        // Deck mode (hide_after_drop=false): fall back to the next card.
+        assert_eq!(
+            plan_drag_outcome(true, false, true, true, false, false),
+            DropAction::Reshow
+        );
+        // Cancelled move-drag with cards left -> reshow, nothing is lost.
+        assert_eq!(
+            plan_drag_outcome(true, false, false, true, true, false),
             DropAction::Reshow
         );
         // Unknown id but dropped with hide_after_drop -> hide anyway.
