@@ -1,6 +1,6 @@
 [package]
 name = "snapdrop"
-version = "1.0.0"
+version = "1.0.1"
 description = "Windows screenshot capture & drag-to-drop utility"
 authors = ["SnapDrop"]
 edition = "2021"
