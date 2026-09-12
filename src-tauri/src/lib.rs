@@ -270,6 +270,21 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            // The Rust side is the always-alive witness: log focus and
+            // lifetime transitions for every window, so a wedge after
+            // minimize/suspend has a backend-side trace even when the
+            // webview's own voice is frozen. (Tauri's WindowEvent has no
+            // minimize/restore variant, so focus + close + destroy is the
+            // full signal available here.)
+            match event {
+                tauri::WindowEvent::Focused(focused) => {
+                    debuglog::log(&format!("window {} focus={focused}", window.label()));
+                }
+                tauri::WindowEvent::Destroyed => {
+                    debuglog::log(&format!("window {} destroyed", window.label()));
+                }
+                _ => {}
+            }
             if window.label() == "main" {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     // Close-to-tray: hide instead of quitting (unless the

@@ -51,7 +51,7 @@ const DV_E_FORMATETC: HRESULT = HRESULT(0x8004_0064u32 as i32);
 const OLE_E_ADVISENOTSUPPORTED: HRESULT = HRESULT(0x8004_0003u32 as i32);
 const E_UNEXPECTED_HR: HRESULT = HRESULT(0x8000_FFFFu32 as i32);
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug)]
 pub struct DragOutcome {
     pub dropped: bool,
     pub moved: bool,

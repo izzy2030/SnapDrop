@@ -16,7 +16,7 @@ use tauri::{AppHandle, Emitter, Event, Listener, Manager};
 
 use crate::{clipboard, filename, notifier, settings};
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug)]
 pub struct EditorPayload {
     /// Full-resolution PNG of the capture as a data URL (base64).
     pub full: String,

@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { api } from "./api";
+import { installWindowDiagnostics } from "./diag";
 import "./styles.css";
 
 interface RecorderState {
@@ -136,6 +137,9 @@ function RecorderToolbar() {
   };
 
   useEffect(() => {
+    const uninstallDiag = installWindowDiagnostics("recorder", () =>
+      `recording=${recordingRef.current} muted=${mutedRef.current} paused=${pausedRef.current}`,
+    );
     // Pull the current state on mount so a late-mounted page is never stuck
     // in the wrong mode (events emitted before the listener registered are
     // simply missed).
@@ -168,6 +172,7 @@ function RecorderToolbar() {
     }, 1000);
 
     return () => {
+      uninstallDiag();
       unsub.then((f) => f());
       clearInterval(poll);
       if (timerRef.current !== undefined) clearInterval(timerRef.current);

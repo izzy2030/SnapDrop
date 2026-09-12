@@ -50,7 +50,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     HWND_TOPMOST, MA_NOACTIVATE, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_SHOWWINDOW,
     SW_HIDE, WM_APP, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_PAINT, WNDCLASSEXW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WM_POWERBROADCAST,
+    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND,
 };
 
 const WM_APP_CMD: u32 = WM_APP + 1;
@@ -354,6 +355,19 @@ unsafe extern "system" fn thumb_wndproc(
         WM_LBUTTONUP => {
             on_button_up(lparam);
             LRESULT(0)
+        }
+        WM_POWERBROADCAST => {
+            // Suspend-side witness: the native thumb thread is always alive,
+            // so OS sleep/wake broadcasts land here even when every webview
+            // is frozen. Must fall through to DefWindowProcW.
+            match wparam.0 as u32 {
+                PBT_APMSUSPEND => crate::debuglog::log("power: OS suspend broadcast"),
+                PBT_APMRESUMESUSPEND | PBT_APMRESUMEAUTOMATIC => {
+                    crate::debuglog::log("power: OS resume broadcast")
+                }
+                _ => {}
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_DESTROY => {
             PostQuitMessage(0);

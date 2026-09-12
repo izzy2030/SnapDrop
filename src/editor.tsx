@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { emit, listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { installWindowDiagnostics } from "./diag";
 import "./styles.css";
 
 type Tool = "pen" | "highlighter" | "arrow" | "rect" | "text" | "number" | "blur";
@@ -59,6 +60,8 @@ function EditorApp() {
   const strokesRef = useRef<Stroke[]>([]);
   const [fit, setFit] = useState({ w: 320, h: 200, scale: 1 });
   const [ready, setReady] = useState(false);
+  const readyRef = useRef(false);
+  readyRef.current = ready;
   const [ocrBusy, setOcrBusy] = useState(false);
   const [ocrMsg, setOcrMsg] = useState<string | null>(null);
   const ocrTimerRef = useRef<number | null>(null);
@@ -144,6 +147,14 @@ function EditorApp() {
     const t = window.setTimeout(() => window.focus(), 300);
     return () => window.clearTimeout(t);
   }, []);
+
+  // Same persistent diagnostics as the other windows, with the editor's
+  // gating flags (image ready, stroke count) attached to captured errors.
+  useEffect(
+    () =>
+      installWindowDiagnostics("editor", () => `ready=${readyRef.current} strokes=${strokesRef.current.length}`),
+    [],
+  );
 
   // Keyboard: Enter confirms, Esc cancels, Ctrl+Z undoes. Enter is handled by
   // the webview (the editor window has focus). Esc is consumed by SnapDrop's

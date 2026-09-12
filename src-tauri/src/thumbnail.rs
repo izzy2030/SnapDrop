@@ -56,6 +56,11 @@ static LAST_RENDERER_POINTERDOWN: AtomicU64 = AtomicU64::new(0);
 /// by the click-stall watchdog: a healthy page starts a drag within moments of
 /// the press; a ghost never does.
 static LAST_DRAG_STARTED_AT: AtomicU64 = AtomicU64::new(0);
+/// Last capture id the heartbeat log line reported. The heartbeat fires every
+/// ~1.5s; the log line only fires on change (see `get_latest_capture`).
+static LAST_HB_LOG_ID: AtomicU64 = AtomicU64::new(0);
+/// Milliseconds of the last heartbeat log line (periodic liveness summary).
+static LAST_HB_LOG_AT: AtomicU64 = AtomicU64::new(0);
 /// Whether the renderer received any input since the last forced recovery.
 /// Cleared by every recovery and set by `report_renderer_input`/
 /// `report_renderer_pointerdown`. The input-stall rule requires it so an
@@ -91,14 +96,24 @@ pub fn get_latest_capture() -> Option<CapturedPayload> {
     let now = now_millis();
     LAST_RENDERER_HEARTBEAT.store(now, Ordering::SeqCst);
     let payload = LATEST_CAPTURE.lock().unwrap().clone();
-    crate::debuglog::log(&format!(
-        "thumbnail: IPC get_latest_capture heartbeat={} payload_id={} preview_len={} input_age_s={} click_age_s={}",
-        now,
-        payload.as_ref().map(|p| p.capture_id).unwrap_or(0),
-        payload.as_ref().map(|p| p.preview.len()).unwrap_or(0),
-        now.saturating_sub(LAST_RENDERER_INPUT.load(Ordering::SeqCst)) / 1000,
-        now.saturating_sub(LAST_RENDERER_POINTERDOWN.load(Ordering::SeqCst)) / 1000
-    ));
+    // Transition-only: a successful 1.5s poll with the same capture is not
+    // information. Log on capture change, on stale input ages that matter to
+    // the watchdog, or at most once a minute as a liveness summary — the
+    // per-poll line buried every lifecycle/error line in multi-day sessions.
+    let id = payload.as_ref().map(|p| p.capture_id).unwrap_or(0);
+    let input_age_s = now.saturating_sub(LAST_RENDERER_INPUT.load(Ordering::SeqCst)) / 1000;
+    let last_id = LAST_HB_LOG_ID.swap(id, Ordering::SeqCst);
+    let last_at = LAST_HB_LOG_AT.swap(now, Ordering::SeqCst);
+    if id != last_id || input_age_s >= 30 || now.saturating_sub(last_at) >= 60_000 {
+        crate::debuglog::log(&format!(
+            "thumbnail: IPC get_latest_capture heartbeat={} payload_id={} preview_len={} input_age_s={} click_age_s={}",
+            now,
+            id,
+            payload.as_ref().map(|p| p.preview.len()).unwrap_or(0),
+            input_age_s,
+            now.saturating_sub(LAST_RENDERER_POINTERDOWN.load(Ordering::SeqCst)) / 1000
+        ));
+    }
     payload
 }
 
@@ -754,10 +769,25 @@ fn recover_now(app: &AppHandle, now: u64, heartbeat: u64, last_input: u64, reaso
 /// capture id and reconciles from `LATEST_CAPTURE`); a genuinely frozen
 /// renderer is handled by the heartbeat watchdog instead.
 pub fn recover_after_resume(app: &AppHandle) {
+    crate::debuglog::log(&format!("app resumed: {}", resume_snapshot()));
     if NATIVE_THUMBNAIL {
         return; // native windows survive sleep; there is no renderer to revive
     }
     recover_if_stale(app);
+}
+
+/// One-line resume context so post-wake anomalies are interpretable: the
+/// "Xs since heartbeat/input" ages mostly measure sleep duration, and this
+/// marker is what says so.
+pub fn resume_snapshot() -> String {
+    let now = now_millis();
+    format!(
+        "thumb_wanted={} native={} heartbeat_age_s={} input_age_s={}",
+        THUMBNAIL_WANTED_VISIBLE.load(Ordering::SeqCst),
+        NATIVE_THUMBNAIL,
+        now.saturating_sub(LAST_RENDERER_HEARTBEAT.load(Ordering::SeqCst)) / 1000,
+        now.saturating_sub(LAST_RENDERER_INPUT.load(Ordering::SeqCst)) / 1000,
+    )
 }
 
 /// Background watchdog: while the thumbnail is meant to be visible, check that

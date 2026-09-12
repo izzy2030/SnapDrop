@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api, HistoryEntry, Settings } from "./api";
+import { installWindowDiagnostics } from "./diag";
 
 type NavTab = "gallery" | "settings" | "about";
 type CanvasFilter = "all" | "today";
@@ -241,6 +242,10 @@ export default function SettingsApp() {
     }, 4000);
     return () => clearInterval(interval);
   }, []);
+
+  // Renderer diagnostics into the persistent log (mount + errors with dedupe),
+  // so a wedged main window leaves the same trail as the thumbnail renderer.
+  useEffect(() => installWindowDiagnostics("main"), []);
 
   // Allow F5 and Ctrl+R manual refresh inside SettingsApp.
   useEffect(() => {

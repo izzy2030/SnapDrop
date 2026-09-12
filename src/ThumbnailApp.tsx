@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api, CapturedPayload, ToastPayload } from "./api";
+import { installWindowDiagnostics } from "./diag";
 
 interface StackItem {
   key: number;
@@ -41,6 +42,16 @@ export default function ThumbnailApp() {
   const reconcileInFlightRef = useRef(false);
   const lastInputAtRef = useRef(0);
   const lastInputReportAtRef = useRef(0);
+  // Frame-staleness probe (re-arming rAF loop below): performance.now() of the
+  // last composed frame, 0 until the first. A one-shot probe would measure
+  // page age, not staleness — this must re-arm every frame.
+  const lastFrameAtRef = useRef(0);
+  const frameStalledRef = useRef(false);
+  // Hidden-interval clock: both wall and monotonic stamps taken on hide; on
+  // show the hidden duration is max(wall Δ, perf Δ) so an OS time correction
+  // across sleep cannot corrupt the ordering.
+  const hiddenAtRef = useRef<{ wall: number; perf: number } | null>(null);
+  const lastReconcileIdRef = useRef(0);
 
   const removeFromStack = useCallback((path: string) => {
     setStack((s) => {
@@ -87,7 +98,13 @@ export default function ThumbnailApp() {
       void api
         .getLatestCapture()
         .then((p) => {
-          api.debugLog(`reconcile success elapsed_ms=${Math.round(performance.now() - startedAt)} id=${p ? p.capture_id : "null"} preview_len=${p?.preview?.length ?? 0}`).catch(() => {});
+          // Transition-only: the 1.5s poll succeeding with the same capture
+          // is not information. Log only when the id changes (or is null).
+          const id = p ? p.capture_id : 0;
+          if (id !== lastReconcileIdRef.current) {
+            lastReconcileIdRef.current = id;
+            api.debugLog(`reconcile success elapsed_ms=${Math.round(performance.now() - startedAt)} id=${p ? p.capture_id : "null"} preview_len=${p?.preview?.length ?? 0}`).catch(() => {});
+          }
           if (p) addCapture(p);
         })
         .catch((e) => {
@@ -103,7 +120,7 @@ export default function ThumbnailApp() {
     // session). Send a throwaway probe first so the real diagnostics below are
     // guaranteed to land in the log.
     api.debugLog("ipc warmup").catch(() => {});
-    api.debugLog(`renderer mounted href=${window.location.href} visibility=${document.visibilityState} dpr=${window.devicePixelRatio}`).catch(() => {});
+    // Mount is logged by installWindowDiagnostics below (tag "thumb").
     reconcileLatest();
     const reconcileTimer = window.setInterval(reconcileLatest, 1500);
 
@@ -260,21 +277,71 @@ export default function ThumbnailApp() {
     };
   }, []);
 
+  // Frame-staleness loop: re-arms every frame. If frames stop (compositor
+  // frozen while JS timers/IPC keep running — the ghost state), the watchdog
+  // cannot tell from the heartbeat alone; frame_age_s in the lines below can.
   useEffect(() => {
-    const reportVisibility = () => {
-      api.debugLog(`renderer visibility=${document.visibilityState} hidden=${document.hidden} stack=${stack.length} current_id=${stack[0]?.captureId ?? 0} input_age_s=${Math.round((Date.now() - lastInputAtRef.current) / 1000)}`).catch(() => {});
+    let alive = true;
+    let raf = 0;
+    const tick = () => {
+      if (!alive) return;
+      const now = performance.now();
+      if (lastFrameAtRef.current !== 0 && now - lastFrameAtRef.current > 5000 && !frameStalledRef.current) {
+        frameStalledRef.current = true;
+        api.debugLog(`renderer frames STALLED gap_s=${((now - lastFrameAtRef.current) / 1000).toFixed(0)}`).catch(() => {});
+      } else if (frameStalledRef.current && now - lastFrameAtRef.current <= 5000) {
+        frameStalledRef.current = false;
+        api.debugLog("renderer frames resumed").catch(() => {});
+      }
+      lastFrameAtRef.current = now;
+      raf = requestAnimationFrame(tick);
     };
-    document.addEventListener("visibilitychange", reportVisibility);
-    window.addEventListener("pageshow", reportVisibility);
-    window.addEventListener("pagehide", reportVisibility);
-    window.addEventListener("error", (e) => api.debugLog(`renderer window.error message=${e.message} source=${e.filename}:${e.lineno}:${e.colno}`).catch(() => {}));
-    window.addEventListener("unhandledrejection", (e) => api.debugLog(`renderer unhandledrejection reason=${String(e.reason)}`).catch(() => {}));
+    raf = requestAnimationFrame(tick);
     return () => {
-      document.removeEventListener("visibilitychange", reportVisibility);
-      window.removeEventListener("pageshow", reportVisibility);
-      window.removeEventListener("pagehide", reportVisibility);
+      alive = false;
+      cancelAnimationFrame(raf);
     };
-  }, [stack]);
+  }, []);
+
+  useEffect(() => {
+    // Snapshot of exactly the flags that gate this feature, attached to
+    // lifecycle lines and captured errors so either is interpretable alone.
+    const snap = () => {
+      const frameAge =
+        lastFrameAtRef.current === 0
+          ? "n/a"
+          : `${Math.round((performance.now() - lastFrameAtRef.current) / 1000)}`;
+      return `stack=${stack.length} current_id=${stack[0]?.captureId ?? 0} expanded=${expanded} input_age_s=${Math.round((Date.now() - lastInputAtRef.current) / 1000)} frame_age_s=${frameAge}`;
+    };
+    const onVisibility = () => {
+      if (document.hidden) {
+        hiddenAtRef.current = { wall: Date.now(), perf: performance.now() };
+        api.debugLog(`renderer lifecycle event=hidden ${snap()}`).catch(() => {});
+      } else {
+        const h = hiddenAtRef.current;
+        hiddenAtRef.current = null;
+        let dur = "unknown";
+        if (h) {
+          const wall = (Date.now() - h.wall) / 1000;
+          const perf = (performance.now() - h.perf) / 1000;
+          dur = `${Math.max(wall, perf).toFixed(1)}s (wall=${wall.toFixed(1)} perf=${perf.toFixed(1)})`;
+        }
+        api.debugLog(`renderer lifecycle event=visible hidden_for=${dur} ${snap()}`).catch(() => {});
+      }
+    };
+    const onShow = () => api.debugLog(`renderer lifecycle event=pageshow ${snap()}`).catch(() => {});
+    const onHide = () => api.debugLog(`renderer lifecycle event=pagehide ${snap()}`).catch(() => {});
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pageshow", onShow);
+    window.addEventListener("pagehide", onHide);
+    const uninstallErrors = installWindowDiagnostics("thumb", snap);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pageshow", onShow);
+      window.removeEventListener("pagehide", onHide);
+      uninstallErrors();
+    };
+  }, [stack, expanded]);
 
   return (
     <div className="thumbnail-root">

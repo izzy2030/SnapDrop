@@ -10,6 +10,39 @@ use windows::Win32::Foundation::HWND;
 
 use crate::{clipboard, dragdrop, filename, history, hotkey, ocr, settings, thumbnail};
 
+/// IPC span: logs command name + wall duration + truncated outcome to the
+/// debug log, so "an IPC was in flight at suspend and never resolved" is
+/// provable (start line with no done line). Outcomes are Debug-truncated so
+/// base64 previews cannot flood the log. Wrap each command body:
+/// sync: `cmd_span!("name", { ... })`, async: `cmd_span_async!("name", { ... })`.
+/// Bodies run inside a closure, so existing `return`/`?` keep working.
+macro_rules! cmd_span {
+    ($name:literal, $body:block) => {{
+        let __t = std::time::Instant::now();
+        let __r = (|| $body)();
+        let mut __s = format!("{:?}", __r);
+        if __s.len() > 200 {
+            __s.truncate(__s.floor_char_boundary(200));
+            __s.push('\u{2026}');
+        }
+        crate::debuglog::log(&format!("ipc {} ms={} out={}", $name, __t.elapsed().as_millis(), __s));
+        __r
+    }};
+}
+macro_rules! cmd_span_async {
+    ($name:literal, $body:block) => {{
+        let __t = std::time::Instant::now();
+        let __r = (|| async $body)().await;
+        let mut __s = format!("{:?}", __r);
+        if __s.len() > 200 {
+            __s.truncate(__s.floor_char_boundary(200));
+            __s.push('\u{2026}');
+        }
+        crate::debuglog::log(&format!("ipc {} ms={} out={}", $name, __t.elapsed().as_millis(), __s));
+        __r
+    }};
+}
+
 /// Decoded-preview cache, keyed by capture path. Capture files are immutable
 /// once written, so a path's preview never changes — decode each screenshot
 /// at most once per process. (Without this, every history refresh re-read and
@@ -170,15 +203,19 @@ fn video_thumbnail_data_url(path: &str) -> Option<String> {
 
 #[tauri::command]
 pub fn get_settings(app: AppHandle) -> settings::Settings {
+    cmd_span!("get_settings", {
     let mut s = settings::get(&app);
     s.screenshot_dir = filename::expand_dir(&s.screenshot_dir)
         .to_string_lossy()
         .to_string();
     s
+
+    })
 }
 
 #[tauri::command]
 pub fn update_settings(app: AppHandle, settings: settings::Settings) -> Result<(), String> {
+    cmd_span!("update_settings", {
     let old = settings::get(&app);
 
     // Validate the screenshot directory before accepting changes.
@@ -228,15 +265,21 @@ pub fn update_settings(app: AppHandle, settings: settings::Settings) -> Result<(
     settings::save(&app, &settings)?;
     crate::tray::refresh(&app);
     Ok(())
+
+    })
 }
 
 #[tauri::command]
 pub fn get_history(app: AppHandle) -> Vec<history::HistoryEntry> {
+    cmd_span!("get_history", {
     history::entries(&app)
+
+    })
 }
 
 #[tauri::command]
 pub fn delete_capture(app: AppHandle, path: String) -> Result<(), String> {
+    cmd_span!("delete_capture", {
     let s = settings::get(&app);
     if s.delete_files_on_remove {
         if let Err(e) = fs::remove_file(&path) {
@@ -246,10 +289,13 @@ pub fn delete_capture(app: AppHandle, path: String) -> Result<(), String> {
     history::remove(&app, &path);
     crate::tray::refresh(&app);
     Ok(())
+
+    })
 }
 
 #[tauri::command]
 pub fn clear_history(app: AppHandle) -> Result<(), String> {
+    cmd_span!("clear_history", {
     let s = settings::get(&app);
     if s.delete_files_on_remove {
         for entry in history::entries(&app) {
@@ -261,15 +307,21 @@ pub fn clear_history(app: AppHandle) -> Result<(), String> {
     history::clear(&app);
     crate::tray::refresh(&app);
     Ok(())
+
+    })
 }
 
 #[tauri::command]
 pub fn open_capture(_app: AppHandle, path: String) -> Result<(), String> {
+    cmd_span!("open_capture", {
     open_with_default_app(&path)
+
+    })
 }
 
 #[tauri::command]
 pub fn reveal_capture(app: AppHandle, path: String) -> Result<(), String> {
+    cmd_span!("reveal_capture", {
     let result = reveal_in_explorer(&path);
     // Same dismissal logic as a successful drop: once the capture has been
     // handed off (revealed in Explorer), hide the floating thumbnail if the
@@ -281,11 +333,16 @@ pub fn reveal_capture(app: AppHandle, path: String) -> Result<(), String> {
         }
     }
     result
+
+    })
 }
 
 #[tauri::command]
 pub fn open_folder(app: AppHandle) -> Result<(), String> {
+    cmd_span!("open_folder", {
     open_folder_inner(&app)
+
+    })
 }
 
 /// Open the configured screenshot folder in Explorer (tray + Settings).
@@ -556,6 +613,7 @@ fn open_folder_plain(path: &str) -> Result<(), String> {
 
 #[tauri::command]
 pub fn start_drag(app: AppHandle, paths: Vec<String>) -> Result<dragdrop::DragOutcome, String> {
+    cmd_span!("start_drag", {
     // The watchdog compares pointerdown vs drag-start: a healthy page starts a
     // drag moments after the press, a wedged renderer never does.
     thumbnail::note_drag_started();
@@ -572,10 +630,13 @@ pub fn start_drag(app: AppHandle, paths: Vec<String>) -> Result<dragdrop::DragOu
         }
     }
     Ok(outcome)
+
+    })
 }
 
 #[tauri::command]
 pub fn copy_capture(_app: AppHandle, path: String) -> Result<(), String> {
+    cmd_span!("copy_capture", {
     let p = Path::new(&path);
     // Re-copy the image + file to the clipboard.
     if let Ok(img) = image::open(p) {
@@ -590,6 +651,8 @@ pub fn copy_capture(_app: AppHandle, path: String) -> Result<(), String> {
         clipboard::set_file(p)?;
     }
     Ok(())
+
+    })
 }
 
 #[tauri::command]
@@ -597,6 +660,7 @@ pub fn copy_capture(_app: AppHandle, path: String) -> Result<(), String> {
 pub async fn video_record_stop(
     app: AppHandle,
 ) -> Result<crate::video_recording::RecordingResult, String> {
+    cmd_span_async!("video_record_stop", {
     // Runs on the async runtime thread, NOT the main/UI thread. Stopping joins
     // the WGC capture thread, which finalizes the encoder by blocking on the
     // Media Foundation transcoder join. That whole chain would otherwise run on
@@ -604,16 +668,21 @@ pub async fn video_record_stop(
     tauri::async_runtime::spawn_blocking(move || crate::video_recording::stop_recording(&app))
         .await
         .map_err(|e| e.to_string())?
+
+    })
 }
 
 #[tauri::command]
 #[cfg(windows)]
 pub fn video_record_state(app: AppHandle) -> bool {
+    cmd_span!("video_record_state", {
     use tauri::Manager;
     app.state::<Mutex<crate::video_recording::VideoRecorder>>()
         .lock()
         .unwrap()
         .is_recording()
+
+    })
 }
 
 /// Start recording the armed region (picked via Ctrl+Alt+V). Called by the
@@ -622,6 +691,7 @@ pub fn video_record_state(app: AppHandle) -> bool {
 #[tauri::command]
 #[cfg(windows)]
 pub async fn video_record_begin(app: AppHandle) -> Result<String, String> {
+    cmd_span_async!("video_record_begin", {
     tauri::async_runtime::spawn_blocking(move || {
         let pending = {
             let rec_state = app.state::<Mutex<crate::video_recording::VideoRecorder>>();
@@ -652,6 +722,8 @@ pub async fn video_record_begin(app: AppHandle) -> Result<String, String> {
     })
     .await
     .map_err(|e| e.to_string())?
+
+    })
 }
 
 /// Cancel an armed (not yet started) recording: clears the pending region,
@@ -659,6 +731,7 @@ pub async fn video_record_begin(app: AppHandle) -> Result<String, String> {
 #[tauri::command]
 #[cfg(windows)]
 pub fn video_record_arm_cancel(app: AppHandle) -> Result<(), String> {
+    cmd_span!("video_record_arm_cancel", {
     let (was_visible, was_minimized) = {
         let rec_state = app.state::<Mutex<crate::video_recording::VideoRecorder>>();
         let mut rec = rec_state.lock().unwrap();
@@ -680,20 +753,28 @@ pub fn video_record_arm_cancel(app: AppHandle) -> Result<(), String> {
     crate::capture_flow::restore_main_window(&app, was_visible, was_minimized);
     crate::debuglog::log("video: armed recording cancelled");
     Ok(())
+
+    })
 }
 
 /// Toggle the system-audio mute; returns the new state for the toolbar UI.
 #[tauri::command]
 #[cfg(windows)]
 pub fn video_toggle_mute() -> bool {
+    cmd_span!("video_toggle_mute", {
     crate::toolbar::toggle_mute()
+
+    })
 }
 
 /// Current muted state (toolbar reads it on mount).
 #[tauri::command]
 #[cfg(windows)]
 pub fn video_mute_state() -> bool {
+    cmd_span!("video_mute_state", {
     crate::toolbar::is_muted()
+
+    })
 }
 
 /// Flip recording pause; returns the new state (for the toolbar UI). Only
@@ -701,30 +782,43 @@ pub fn video_mute_state() -> bool {
 #[tauri::command]
 #[cfg(windows)]
 pub fn video_toggle_pause() -> bool {
+    cmd_span!("video_toggle_pause", {
     crate::toolbar::toggle_pause()
+
+    })
 }
 
 /// Current paused state (toolbar reads it on mount / poll).
 #[tauri::command]
 #[cfg(windows)]
 pub fn video_pause_state() -> bool {
+    cmd_span!("video_pause_state", {
     crate::toolbar::is_paused()
+
+    })
 }
 
 #[tauri::command]
 pub fn capture_now(app: AppHandle) -> Result<(), String> {
+    cmd_span!("capture_now", {
     hotkey::trigger_capture(&app);
     Ok(())
+
+    })
 }
 
 #[tauri::command]
 pub fn capture_video_now(app: AppHandle) -> Result<(), String> {
+    cmd_span!("capture_video_now", {
     hotkey::trigger_capture_video(&app);
     Ok(())
+
+    })
 }
 
 #[tauri::command]
 pub async fn get_capture_preview(_app: AppHandle, path: String) -> Result<String, String> {
+    cmd_span_async!("get_capture_preview", {
     // Cache hit → instant, no decode. Cache misses are decoded via
     // spawn_blocking: `async` + blocking pool keeps the heavy PNG decode OFF
     // the main/UI thread. A synchronous decode of a full-size screenshot
@@ -750,24 +844,35 @@ pub async fn get_capture_preview(_app: AppHandle, path: String) -> Result<String
         }
     }
     result
+
+    })
 }
 
 #[tauri::command]
 pub fn hide_thumbnail(app: AppHandle) -> Result<(), String> {
+    cmd_span!("hide_thumbnail", {
     thumbnail::hide_all(&app)
+
+    })
 }
 
 #[tauri::command]
 pub fn pause_hotkey(app: AppHandle, paused: bool) -> Result<(), String> {
+    cmd_span!("pause_hotkey", {
     crate::PAUSED.store(paused, std::sync::atomic::Ordering::SeqCst);
     hotkey::pause(&app, paused);
     crate::tray::refresh(&app);
     Ok(())
+
+    })
 }
 
 #[tauri::command]
 pub fn get_app_version() -> String {
+    cmd_span!("get_app_version", {
     env!("CARGO_PKG_VERSION").to_string()
+
+    })
 }
 
 /// OCR the pending editor capture and return the recognized text. Runs on a
@@ -775,23 +880,32 @@ pub fn get_app_version() -> String {
 /// the main/UI thread.
 #[tauri::command]
 pub async fn ocr_pending_editor_image() -> Result<String, String> {
+    cmd_span_async!("ocr_pending_editor_image", {
     let Some((bgra, w, h)) = crate::editor::pending_bgra() else {
         return Err("No pending capture to recognize".into());
     };
     tauri::async_runtime::spawn_blocking(move || ocr::recognize(&bgra, w, h))
         .await
         .map_err(|e| format!("OCR task failed: {e}"))?
+
+    })
 }
 
 /// Copy plain text to the clipboard (editor OCR result).
 #[tauri::command]
 pub fn copy_text(text: String) -> Result<(), String> {
+    cmd_span!("copy_text", {
     clipboard::set_text(&text)
+
+    })
 }
 
 #[tauri::command]
 pub fn get_pending_editor_image() -> Option<crate::editor::EditorPayload> {
+    cmd_span!("get_pending_editor_image", {
     crate::editor::get_pending_image()
+
+    })
 }
 
 #[tauri::command]
@@ -821,22 +935,34 @@ pub fn report_renderer_pointerdown() {
 
 #[tauri::command]
 pub fn get_debug_log(app: AppHandle) -> Result<String, String> {
+    cmd_span!("get_debug_log", {
     crate::debuglog::read(&app)
+
+    })
 }
 
 #[tauri::command]
 pub fn get_prev_debug_log(app: AppHandle) -> Result<String, String> {
+    cmd_span!("get_prev_debug_log", {
     crate::debuglog::read_previous(&app)
+
+    })
 }
 
 #[tauri::command]
 pub fn open_debug_log(app: AppHandle) -> Result<(), String> {
+    cmd_span!("open_debug_log", {
     crate::debuglog::open(&app)
+
+    })
 }
 
 #[tauri::command]
 pub fn open_prev_debug_log(app: AppHandle) -> Result<(), String> {
+    cmd_span!("open_prev_debug_log", {
     crate::debuglog::open_previous(&app)
+
+    })
 }
 
 /// Liveness signal from the main (Settings) window's page. The page calls
@@ -845,12 +971,18 @@ pub fn open_prev_debug_log(app: AppHandle) -> Result<(), String> {
 /// startup watchdog logs it and reloads the page once.
 #[tauri::command]
 pub fn report_main_renderer_ready() {
+    cmd_span!("report_main_renderer_ready", {
     crate::note_main_renderer_ready();
+
+    })
 }
 
 #[tauri::command]
 pub fn show_settings(app: AppHandle) -> Result<(), String> {
+    cmd_span!("show_settings", {
     show_settings_inner(&app)
+
+    })
 }
 
 pub fn show_settings_inner(app: &AppHandle) -> Result<(), String> {
@@ -878,6 +1010,7 @@ pub fn show_settings_inner(app: &AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub fn pick_folder(current: String) -> Result<Option<String>, String> {
+    cmd_span!("pick_folder", {
     let dialog = rfd::FileDialog::new().set_title("Choose Screenshot Folder");
     let dialog = if current.is_empty() {
         dialog
@@ -886,6 +1019,8 @@ pub fn pick_folder(current: String) -> Result<Option<String>, String> {
     };
     let picked = dialog.pick_folder();
     Ok(picked.map(|p| p.to_string_lossy().to_string()))
+
+    })
 }
 
 pub fn open_with_default_app(path: &str) -> Result<(), String> {

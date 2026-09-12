@@ -8,7 +8,9 @@
 //! the debug log is the only evidence — it must survive the relaunch that
 //! usually follows a hang.
 
+use std::collections::hash_map::DefaultHasher;
 use std::fs::OpenOptions;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -18,6 +20,13 @@ use tauri::Manager;
 
 static LOG: Mutex<Option<PathBuf>> = Mutex::new(None);
 static START: OnceLock<Instant> = OnceLock::new();
+static SESSION_ID: OnceLock<String> = OnceLock::new();
+
+/// Max bytes per session log file. The heartbeat/reconcile chatter plus an
+/// error flood could otherwise grow one file forever and flush the
+/// visibility/lifecycle history out of any readable window. On breach the
+/// file rotates (dropping the older prev) with a marker line.
+const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 
 fn elapsed_secs() -> f64 {
     let start = *START.get_or_init(Instant::now);
@@ -61,11 +70,38 @@ pub fn init_path(path: PathBuf) {
     // Drop the guard BEFORE logging: `log` re-locks this mutex, and std Mutex
     // is not reentrant — locking it twice on the same thread would deadlock
     // the main thread during setup (app appears frozen, hotkey never fires).
+    let prev = path.with_extension("prev.log");
+    let prev_status = prev_ended_cleanly(&prev);
     {
         let mut guard = LOG.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(path);
     }
-    log(&format!("===== session start ({}) =====", wall_clock()));
+    let id = SESSION_ID.get_or_init(new_session_id);
+    log(&format!("===== session start id={id} ({}) =====", wall_clock()));
+    match prev_status {
+        None => log("previous session: none (first run, or no prev log)"),
+        Some(true) => log("previous session: ended cleanly"),
+        Some(false) => {
+            log("previous session: UNCLEAN (no exit marker — may have wedged; see prev log)")
+        }
+    }
+}
+
+/// Unique id for this process run, so restart-vs-resume is greppable.
+fn new_session_id() -> String {
+    let mut h = DefaultHasher::new();
+    std::process::id().hash(&mut h);
+    SystemTime::now().hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// Whether the previous session's log ends with the clean-exit marker.
+/// Reads only the last 4KB: the file is size-capped but a wedged session's
+/// prev log is exactly the evidence this must not disturb. None = no prev log.
+fn prev_ended_cleanly(prev: &PathBuf) -> Option<bool> {
+    let data = std::fs::read(prev).ok()?;
+    let tail = if data.len() > 4096 { &data[data.len() - 4096..] } else { &data[..] };
+    Some(String::from_utf8_lossy(tail).contains("session end (clean exit)"))
 }
 
 fn log_path(app: &tauri::AppHandle) -> PathBuf {
@@ -123,7 +159,17 @@ pub fn log(msg: &str) {
     // exactly when a panic is being diagnosed.
     let guard = LOG.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(path) = guard.as_ref() {
+        // Size cap: rotate mid-session instead of growing forever.
+        let rotated = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > MAX_LOG_BYTES;
+        if rotated {
+            let prev = path.with_extension("prev.log");
+            let _ = std::fs::remove_file(&prev);
+            let _ = std::fs::rename(path, &prev);
+        }
         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+            if rotated {
+                let _ = f.write_all(b"--- log rotated (size cap 2MB) ---\n");
+            }
             let _ = f.write_all(line.as_bytes());
         }
     }
