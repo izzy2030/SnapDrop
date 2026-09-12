@@ -580,9 +580,47 @@ unsafe fn on_button_down(hwnd: HWND, lparam: LPARAM) {
     handle_drag_outcome(hwnd, id, dropped, moved, hide_after_drop);
 }
 
-/// Apply a finished drag's outcome: remove the card on move-effect, hide on a
-/// successful drop (per settings), and toggle the expanded list on a plain
-/// click (press + release without movement).
+/// Pure decision half of `handle_drag_outcome` (no HWND): which window action a
+/// finished drag implies. Extracted so the drop→stack→visibility rules are
+/// unit-testable — this is where a dropped-but-unmoved card used to linger in
+/// the stack and resurface as a ghost after the next drop.
+#[derive(Debug, PartialEq, Eq)]
+enum DropAction {
+    Hide,
+    Reshow,
+    Click { toggle_expand: bool },
+    Nothing,
+}
+
+fn plan_drag_outcome(
+    removed: bool,
+    stack_empty: bool,
+    dropped: bool,
+    moved: bool,
+    hide_after_drop: bool,
+    can_expand: bool,
+) -> DropAction {
+    if removed {
+        if stack_empty {
+            DropAction::Hide
+        } else {
+            DropAction::Reshow
+        }
+    } else if dropped && hide_after_drop {
+        DropAction::Hide
+    } else if !dropped && !moved {
+        DropAction::Click {
+            toggle_expand: can_expand,
+        }
+    } else {
+        DropAction::Nothing
+    }
+}
+
+/// Apply a finished drag's outcome: retire the card on any successful drop
+/// (moved or not — a press+release can still complete as a drop), hide on an
+/// empty stack or a successful drop (per settings), and toggle the expanded
+/// list on a plain click (press + release without movement or drop).
 fn handle_drag_outcome(
     hwnd: HWND,
     capture_id: u64,
@@ -592,40 +630,49 @@ fn handle_drag_outcome(
 ) {
     let mut guard = state().lock().unwrap();
     let st = &mut *guard;
-    if moved && stack_remove(&mut st.stack, &mut st.seen, capture_id) {
-        if st.stack.is_empty() {
+    // A drop always retires its card. The old code only removed on `moved`,
+    // so a drop without cursor movement hid the window but left a stale entry
+    // that resurfaced full-size after the *next* drop and lingered until that
+    // present's auto-hide timer fired — the recurring previous-shot ghost.
+    let removed = (moved || dropped) && stack_remove(&mut st.stack, &mut st.seen, capture_id);
+    let action = plan_drag_outcome(
+        removed,
+        st.stack.is_empty(),
+        dropped,
+        moved,
+        hide_after_drop,
+        st.stack.len() > 1 && now_ms().saturating_sub(st.last_dbl_ms) >= 700,
+    );
+    match action {
+        DropAction::Hide => {
             drop(guard);
             unsafe {
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
-            return;
         }
-        st.expanded = false;
-        drop(guard);
-        unsafe {
-            show_at(hwnd, current_window_size(), None);
-            let _ = InvalidateRect(Some(hwnd), None, false);
-        }
-    } else if dropped && hide_after_drop {
-        drop(guard);
-        unsafe {
-            let _ = ShowWindow(hwnd, SW_HIDE);
-        }
-    } else if !dropped && !moved {
-        // Plain click: toggle the expanded list (if more than one).
-        let suppress = now_ms().saturating_sub(st.last_dbl_ms) < 700;
-        if !suppress && st.stack.len() > 1 {
-            st.expanded = !st.expanded;
-            let expanded = st.expanded;
+        DropAction::Reshow => {
+            st.expanded = false;
             drop(guard);
             unsafe {
                 show_at(hwnd, current_window_size(), None);
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
-            crate::debuglog::log(&format!("native_thumb: expanded={expanded}"));
         }
-        unsafe {
-            let _ = InvalidateRect(Some(hwnd), None, false);
+        DropAction::Click { toggle_expand } => {
+            if toggle_expand {
+                st.expanded = !st.expanded;
+                let expanded = st.expanded;
+                drop(guard);
+                unsafe {
+                    show_at(hwnd, current_window_size(), None);
+                }
+                crate::debuglog::log(&format!("native_thumb: expanded={expanded}"));
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
         }
+        DropAction::Nothing => {}
     }
 }
 
@@ -933,6 +980,60 @@ mod tests {
         assert!(!seen.contains(&2));
         // Removing an unknown id is a no-op.
         assert!(!stack_remove(&mut stack, &mut seen, 99));
+    }
+
+    #[test]
+    fn drop_without_movement_still_retires_the_card() {
+        // Regression: a press+release that completes as a drop (moved=false,
+        // dropped=true) hid the window but left the card in the stack; the
+        // stale entry resurfaced full-size after the next drop and lingered
+        // until that present's auto-hide timer — the recurring ghost.
+        assert_eq!(
+            plan_drag_outcome(true, true, true, false, true, false),
+            DropAction::Hide
+        );
+        assert_eq!(
+            plan_drag_outcome(true, true, true, false, false, false),
+            DropAction::Hide
+        );
+    }
+
+    #[test]
+    fn drag_outcome_planner_covers_the_matrix() {
+        // Moved drop, stack drained -> hide.
+        assert_eq!(
+            plan_drag_outcome(true, true, true, true, true, false),
+            DropAction::Hide
+        );
+        // Moved drop with older cards left -> reshow the next one.
+        assert_eq!(
+            plan_drag_outcome(true, false, true, true, true, false),
+            DropAction::Reshow
+        );
+        // Unknown id but dropped with hide_after_drop -> hide anyway.
+        assert_eq!(
+            plan_drag_outcome(false, false, true, false, true, false),
+            DropAction::Hide
+        );
+        // Cancelled move-drag of unknown id, no setting -> nothing.
+        assert_eq!(
+            plan_drag_outcome(false, false, false, true, false, false),
+            DropAction::Nothing
+        );
+        // Plain click with a deck -> toggle expand.
+        assert_eq!(
+            plan_drag_outcome(false, false, false, false, false, true),
+            DropAction::Click {
+                toggle_expand: true
+            }
+        );
+        // Plain click, single card -> repaint only.
+        assert_eq!(
+            plan_drag_outcome(false, true, false, false, false, false),
+            DropAction::Click {
+                toggle_expand: false
+            }
+        );
     }
 
     #[test]
