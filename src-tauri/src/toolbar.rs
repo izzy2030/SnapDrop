@@ -12,7 +12,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use windows::Win32::Foundation::RECT;
-use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE};
+use windows::Win32::UI::WindowsAndMessaging::{
+    SetWindowDisplayAffinity, SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_SHOWWINDOW, WDA_EXCLUDEFROMCAPTURE,
+};
 
 // Must match the `recorder_toolbar` window in tauri.conf.json.
 const TOOLBAR_W: i32 = 360;
@@ -83,6 +86,47 @@ fn apply_exclude_from_capture_to(win: &tauri::WebviewWindow) {
     }
 }
 
+/// Show a floating recorder window AND re-assert it at the top of the
+/// topmost band, without activating it.
+///
+/// A bare `win.show()` (`ShowWindow(SW_SHOW)`) only reveals the window at
+/// whatever Z-slot it last occupied — it neither raises the window nor
+/// restores `WS_EX_TOPMOST` if the shell or another app stripped the style
+/// while the window sat hidden. These windows are created once at startup,
+/// so after days in the tray their remembered Z-slot is buried under every
+/// window opened since: the armed toolbar/border would appear *behind*
+/// everything (observed: the Ctrl+Shift+V selection "disappeared" and the
+/// record controls only surfaced after minimizing all other windows).
+///
+/// The editor (`editor.rs`) and native thumbnail (`native_thumb.rs`) already
+/// re-assert topmost on every show; the recorder windows must do the same.
+///
+/// The raw Win32 raise runs *after* tao's `show()` so tao's cached VISIBLE
+/// flag stays in sync with reality (the `diff == empty` no-op desync
+/// documented in TAURI_TRAY_SLEEP_GUIDE.md) — otherwise a later tauri
+/// `hide()` could no-op and leave the toolbar on screen. `SWP_NOACTIVATE`
+/// keeps keyboard focus in the app being recorded.
+fn show_raised(win: &tauri::WebviewWindow) {
+    let _ = win.show();
+    if let Ok(hwnd) = win.hwnd() {
+        let h = windows::Win32::Foundation::HWND(hwnd.0);
+        let r = unsafe {
+            SetWindowPos(
+                h,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+        };
+        if let Err(e) = r {
+            log::warn!("toolbar: topmost raise failed: {e}");
+        }
+    }
+}
+
 /// Position the toolbar just below the recording region (falling back to just
 /// above it, then clamped inside the monitor).
 fn place(app: &AppHandle, region: RECT) {
@@ -111,7 +155,7 @@ pub fn arm(app: &AppHandle, region: RECT) {
     place(app, region);
     apply_exclude_from_capture(app);
     if let Some(win) = app.get_webview_window("recorder_toolbar") {
-        let _ = win.show();
+        show_raised(&win);
     }
     let _ = app.emit(
         "video_recorder_state",
@@ -126,7 +170,7 @@ pub fn show_recording(app: &AppHandle) {
     PAUSED.store(false, Ordering::SeqCst);
     apply_exclude_from_capture(app);
     if let Some(win) = app.get_webview_window("recorder_toolbar") {
-        let _ = win.show();
+        show_raised(&win);
     }
     let _ = app.emit(
         "video_recorder_state",
@@ -159,7 +203,7 @@ pub fn show_border(app: &AppHandle, region: RECT) {
     let _ = win.set_size(tauri::PhysicalSize::new(w, h));
     apply_exclude_from_capture_to(&win);
     let _ = win.set_ignore_cursor_events(true);
-    let _ = win.show();
+    show_raised(&win);
 }
 
 /// Hide the region border (recording ended or cancelled).
