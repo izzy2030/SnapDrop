@@ -581,16 +581,18 @@ pub fn start_recording(
     let item_monitor = Monitor::from_raw_hmonitor(monitor.hmonitor.0);
 
     let flags = RecorderFlags { region, monitor_rect, output_path: path.clone(), fps, quality, audio_disabled: false };
+    let (cursor, border, interval) = crate::capture::compatible_capture_settings(
+        CursorCaptureSettings::Default,
+        DrawBorderSettings::WithoutBorder,
+        MinimumUpdateIntervalSettings::Custom(Duration::from_nanos(1_000_000_000 / fps as u64)),
+    );
 
     let settings = Settings::new(
         item_monitor,
-        CursorCaptureSettings::Default,
-        DrawBorderSettings::WithoutBorder,
+        cursor,
+        border,
         SecondaryWindowSettings::Default,
-        // Nanoseconds, not milliseconds: `from_millis(1000 / 30)` truncates to
-        // 33ms (30.3fps) and quietly desynchronises the requested rate from the
-        // rate the encoder is told to expect.
-        MinimumUpdateIntervalSettings::Custom(Duration::from_nanos(1_000_000_000 / fps as u64)),
+        interval,
         DirtyRegionSettings::Default,
         ColorFormat::Bgra8,
         flags,
@@ -661,12 +663,17 @@ pub fn record_headless(
     let mh = monitor.height().map_err(|e| e.to_string())? as i32;
     let monitor_rect = RECT { left: 0, top: 0, right: mw, bottom: mh };
 
-    let settings = Settings::new(
-        monitor,
+    let (cursor, border, interval) = crate::capture::compatible_capture_settings(
         CursorCaptureSettings::Default,
         DrawBorderSettings::WithoutBorder,
-        SecondaryWindowSettings::Default,
         MinimumUpdateIntervalSettings::Custom(Duration::from_nanos(1_000_000_000 / fps as u64)),
+    );
+    let settings = Settings::new(
+        monitor,
+        cursor,
+        border,
+        SecondaryWindowSettings::Default,
+        interval,
         DirtyRegionSettings::Default,
         ColorFormat::Bgra8,
         RecorderFlags { region, monitor_rect, output_path: path.clone(), fps, quality, audio_disabled },

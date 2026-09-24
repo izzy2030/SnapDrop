@@ -22,20 +22,86 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame;
-use windows_capture::graphics_capture_api::InternalCaptureControl;
+use windows_capture::graphics_capture_api::{GraphicsCaptureApi, InternalCaptureControl};
 use windows_capture::monitor::Monitor;
 use windows_capture::settings::{
     ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
 
-use crate::monitors::{self, MonitorInfo};
+use crate::{
+    debuglog,
+    monitors::{self, MonitorInfo},
+};
 
 pub struct ImageBuf {
     pub width: u32,
     pub height: u32,
     /// BGRA8, top-down. GDI captures set alpha to 0x00; WGC sets it opaque (255).
     pub bgra: Vec<u8>,
+}
+
+pub(crate) fn compatible_capture_settings(
+    requested_cursor: CursorCaptureSettings,
+    requested_border: DrawBorderSettings,
+    requested_interval: MinimumUpdateIntervalSettings,
+) -> (
+    CursorCaptureSettings,
+    DrawBorderSettings,
+    MinimumUpdateIntervalSettings,
+) {
+    let cursor = if requested_cursor == CursorCaptureSettings::Default {
+        requested_cursor
+    } else {
+        match GraphicsCaptureApi::is_cursor_settings_supported() {
+            Ok(true) => requested_cursor,
+            Ok(false) => {
+                debuglog::log("capture: cursor settings unsupported; using default");
+                CursorCaptureSettings::Default
+            }
+            Err(e) => {
+                debuglog::log(&format!(
+                    "capture: cursor settings support check failed; using default: {e}"
+                ));
+                CursorCaptureSettings::Default
+            }
+        }
+    };
+    let border = if requested_border == DrawBorderSettings::Default {
+        requested_border
+    } else {
+        match GraphicsCaptureApi::is_border_settings_supported() {
+            Ok(true) => requested_border,
+            Ok(false) => {
+                debuglog::log("capture: border settings unsupported; using default");
+                DrawBorderSettings::Default
+            }
+            Err(e) => {
+                debuglog::log(&format!(
+                    "capture: border settings support check failed; using default: {e}"
+                ));
+                DrawBorderSettings::Default
+            }
+        }
+    };
+    let interval = if requested_interval == MinimumUpdateIntervalSettings::Default {
+        requested_interval
+    } else {
+        match GraphicsCaptureApi::is_minimum_update_interval_supported() {
+            Ok(true) => requested_interval,
+            Ok(false) => {
+                debuglog::log("capture: update interval unsupported; using default");
+                MinimumUpdateIntervalSettings::Default
+            }
+            Err(e) => {
+                debuglog::log(&format!(
+                    "capture: update interval support check failed; using default: {e}"
+                ));
+                MinimumUpdateIntervalSettings::Default
+            }
+        }
+    };
+    (cursor, border, interval)
 }
 
 /// Capture the given virtual-screen rect (physical pixels) by stitching per-monitor buffers.
@@ -161,13 +227,17 @@ pub fn capture_monitor(mon: &MonitorInfo) -> Option<ImageBuf> {
 pub fn capture_monitor_wgc(mon: &MonitorInfo) -> Option<ImageBuf> {
     let (tx, rx) = mpsc::channel::<Result<ImageBuf, String>>();
     let item = Monitor::from_raw_hmonitor(mon.hmonitor.0);
-    let settings = Settings::new(
-        item,
-        // Match the old GDI output (no cursor in the image).
+    let (cursor, border, interval) = compatible_capture_settings(
         CursorCaptureSettings::WithoutCursor,
         DrawBorderSettings::WithoutBorder,
-        SecondaryWindowSettings::Default,
         MinimumUpdateIntervalSettings::Default,
+    );
+    let settings = Settings::new(
+        item,
+        cursor,
+        border,
+        SecondaryWindowSettings::Default,
+        interval,
         DirtyRegionSettings::Default,
         ColorFormat::Bgra8,
         ShotFlags { tx },

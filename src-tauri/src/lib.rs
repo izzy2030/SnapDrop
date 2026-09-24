@@ -87,6 +87,13 @@ pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 pub fn init_dpi() {
+    #[cfg(windows)]
+    {
+        use windows::core::PCWSTR;
+        use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+        let app_id: Vec<u16> = "com.snapdrop.desktop".encode_utf16().chain(std::iter::once(0)).collect();
+        let _ = unsafe { SetCurrentProcessExplicitAppUserModelID(PCWSTR(app_id.as_ptr())) };
+    }
     dpi::set_per_monitor_dpi_awareness();
 }
 
